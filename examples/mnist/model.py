@@ -84,6 +84,22 @@ class SingleMnistDataset(data.Dataset):
     def __len__(self):
         return len(self.clean_images)
 
+class DNNModel(SerializableModule):
+    def __init__(self):
+        super().__init__()
+        self.use_cuda = True
+        prune_cfg = candle.read_config()
+        self.fc1 = candle.PruneLinear((784, 2048), prune_cfg)
+        self.fc2 = candle.PruneLinear((2048, 1024), prune_cfg)
+        self.fc3 = nn.Linear(1024, 10)
+        self.dropout = nn.Dropout(0.5)
+
+    def forward(self, x):
+        x = x.view(x.size(0), -1)
+        x = F.relu(self.dropout(self.fc1(x)))
+        x = F.relu(self.dropout(self.fc2(x)))
+        return self.fc3(x)
+
 class ConvModel(SerializableModule):
     def __init__(self):
         super().__init__()
@@ -110,12 +126,12 @@ class ConvModel(SerializableModule):
         x = self.dropout(F.relu(self.fc1(x)))
         return self.fc2(x)
 
-def train_adversarial(args):
-    optimizer = torch.optim.SGD(list(filter(lambda x: x.requires_grad, model.parameters())), lr=0.005, momentum=0.9, weight_decay=0.001)
+def train(args):
+    optimizer = torch.optim.SGD(list(filter(lambda x: x.requires_grad, model.parameters())), lr=0.1, momentum=0.9, weight_decay=0.0005)
     criterion = nn.CrossEntropyLoss()
 
     train_set, test_set = SingleMnistDataset.splits(args)
-    train_loader = data.DataLoader(train_set, batch_size=64, shuffle=True, drop_last=True)
+    train_loader = data.DataLoader(train_set, batch_size=100, shuffle=True, drop_last=True)
     test_loader = data.DataLoader(test_set, batch_size=min(32, len(test_set)))
 
     for n_epoch in range(args.n_epochs):
@@ -131,11 +147,13 @@ def train_adversarial(args):
             loss.backward()
             optimizer.step()
             if i % 16 == 0:
-                model.conv1.prune(percentage=0.6)
-                model.conv2.prune(percentage=0.6)
-                model.fc1.prune(percentage=0.6)
+                if n_epoch < args.n_epochs - 2:
+                    model.conv1.prune(percentage=2 * 0.7**n_epoch)
+                    model.conv2.prune(percentage=2 * 0.7**n_epoch)
+                    model.fc1.prune(percentage=2 * 0.7**n_epoch)
+                n_unpruned = candle.count_params(model, type="unpruned")
                 accuracy = (torch.max(scores, 1)[1].view(model_in.size(0)).data == labels.data).sum() / model_in.size(0)
-                print("train accuracy: {:>10}, loss: {:>25}".format(accuracy, loss.data[0]))
+                print("train accuracy: {:>10}, loss: {:>25}, unpruned: {:>10}".format(accuracy, loss.data[0], int(n_unpruned)))
 
     model.eval()
     n = 0
@@ -165,11 +183,11 @@ def main():
     parser.add_argument("--dir", type=str, default="local_data")
     parser.add_argument("--in_file", type=str, default="")
     parser.add_argument("--out_file", type=str, default="output.pt")
-    parser.add_argument("--n_epochs", type=int, default=40)
+    parser.add_argument("--n_epochs", type=int, default=15)
     args, _ = parser.parse_known_args()
     global model
     init_model(input_file=args.in_file)
-    train_adversarial(args)
+    train(args)
 
 if __name__ == "__main__":
     main()

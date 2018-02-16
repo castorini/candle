@@ -6,7 +6,8 @@ import numpy as np
 
 from .model import SerializableModule
 
-def prune_magnitude(weights, weight_masks, percentage=50):
+def prune_magnitude(weights, weight_masks, **kwargs):
+    percentage = kwargs.get("percentage", 50)
     for weight, weight_mask in zip(weights, weight_masks):
         _, indices = torch.sort(torch.abs(weight).view(-1))
         ne0_indices = indices[weight_mask.view(-1)[indices] != 0]
@@ -32,7 +33,7 @@ class WeightProvider(object):
         return self.weights
 
 class GradientTracker(WeightProvider):
-    def __init__(self, weights, alpha):
+    def __init__(self, weights, alpha=0.01):
         super().__init__(weights)
         self.grads = None
         self.alpha = alpha
@@ -50,7 +51,7 @@ def count_prunable_params(model):
     for m in model.modules():
         if isinstance(m, PruneLayer):
             for w in m.weight_masks():
-                n_params += w.view(-1).size(0)
+                n_params += w.view(-1).size(0).data.cpu()[0]
     return n_params
 
 def count_unpruned_params(model):
@@ -58,14 +59,25 @@ def count_unpruned_params(model):
     for m in model.modules():
         if isinstance(m, PruneLayer):
             for w in m.weight_masks():
-                n_params += w.sum()
+                n_params += w.sum().data.cpu()[0]
     return n_params
+
+def count_params(model, type="prunable"):
+    if type == "prunable":
+        return count_prunable_params(model)
+    elif type == "unpruned":
+        return count_unpruned_params(model)
 
 def find_activation(name):
     if name == "thresh_tanh":
         return ThreshTanh()
     else:
         return None
+
+def prune_all(model, **kwargs):
+    for l in model.modules():
+        if isinstance(l, PruneLayer):
+            l.prune(**kwargs)
 
 class PruneLayer(SerializableModule):
     def __init__(self, config):
@@ -107,15 +119,28 @@ class PruneConv2d(PruneLayer):
             dummy_conv = dummy_conv.cuda()
         self.weight = dummy_conv.weight
         self.bias = dummy_conv.bias
+        self.kernel_size = dummy_conv.kernel_size
+        self.out_channels = out_channels
+        self.in_channels = in_channels
+        if not kwargs.get("bias", True):
+            kwargs["bias"] = None
+        if "bias" in kwargs and kwargs["bias"]:
+            del kwargs["bias"]
         self._init_masks()
 
     def weights(self):
-        return [self.weight, self.bias]
+        weights = [self.weight]
+        if self.bias is not None:
+            weights.append(self.bias)
+        return weights
 
     def forward(self, x):
         weight = self.weight * self.weight_masks()[0]
-        bias = self.bias * self.weight_masks()[1]
-        return F.conv2d(x, weight, bias, **self.conv_kwargs)
+        if self.bias is not None:
+            bias = self.bias * self.weight_masks()[1]
+            return F.conv2d(x, weight, bias, **self.conv_kwargs)
+        else:
+            return F.conv2d(x, weight, **self.conv_kwargs)
 
 class PruneLinear(PruneLayer):
     def __init__(self, lin_args, config):
