@@ -126,15 +126,52 @@ class ConvModel(SerializableModule):
         x = self.dropout(F.relu(self.fc1(x)))
         return self.fc2(x)
 
+class TinyModel(SerializableModule):
+    def __init__(self):
+        super().__init__()
+        self.use_cuda = True
+        prune_cfg = candle.read_config()
+        self.conv1 = candle.PruneConv2d((1, 17, 5), prune_cfg)
+        self.bn1 = nn.BatchNorm2d(17, affine=False)
+        self.conv2 = candle.PruneConv2d((17, 10, 3), prune_cfg)
+        self.bn2 = nn.BatchNorm2d(10, affine=False)
+        self.pool = nn.MaxPool2d(3)
+        self.fc = nn.Linear(40, 10)
+
+    def forward(self, x):
+        x = x.unsqueeze(1)
+        x = self.pool(self.bn1(F.relu(self.conv1(x))))
+        x = self.pool(self.bn2(F.relu(self.conv2(x))))
+        x = x.view(x.size(0), -1)
+        return self.fc(x.view(x.size(0), -1))
+
 def train(args):
-    optimizer = torch.optim.SGD(list(filter(lambda x: x.requires_grad, model.parameters())), lr=0.1, momentum=0.9, weight_decay=0.0005)
+    optimizer = torch.optim.SGD(list(filter(lambda x: x.requires_grad, model.parameters())), lr=0.01, momentum=0.9, weight_decay=0.0005)
     criterion = nn.CrossEntropyLoss()
 
     train_set, test_set = SingleMnistDataset.splits(args)
     train_loader = data.DataLoader(train_set, batch_size=64, shuffle=True, drop_last=True)
     test_loader = data.DataLoader(test_set, batch_size=min(32, len(test_set)))
 
-    scheduler = candle.ExponentialPruningScheduler(0.8, 1.5, end_idx=10)
+    # 99.1 inverse grad, 99.4 weight track normal (both 85.461K params), 99.37 none (1729248M params)
+    # 99.17 single prune after 4th epoch (85K params)
+    # 99.1 single prune at 0th epoch (85K params)
+    # scheduler = candle.ExponentialPruningScheduler(0.7, 2, end_idx=6, begin_idx=2) 
+    # scheduler = candle.SinglePruningScheduler(95.057909565, begin_idx=0)
+
+    # 15719 params, 99.22%, 0.9% of model
+    # 97.96 for single prune at 2nd epoch
+    # scheduler = candle.ExponentialPruningScheduler(0.9, 1.4, end_idx=10, begin_idx=2)
+    # scheduler = candle.SinglePruningScheduler(99.090992153, begin_idx=2)
+
+    # 1549 params, 98.12%, 0.09% of model, 20 epochs
+    # 1552 params, single prune at 2nd epoch, 72%
+    # scheduler = candle.ExponentialPruningScheduler(0.92, 1.45, end_idx=16, begin_idx=2)
+    # scheduler = candle.SinglePruningScheduler(99.91042349, begin_idx=2)
+
+    # 1616 params, hand-crafted tiny model, 20 epochs, 98.25%
+    # 98.3%, 334 parameters
+    scheduler = candle.ExponentialPruningScheduler(0.8, 1.3, end_idx=8, begin_idx=2)
 
     for n_epoch in range(args.n_epochs):
         print("Epoch: {}".format(n_epoch + 1))
@@ -147,6 +184,7 @@ def train(args):
             scores = model(model_in)
             loss = criterion(scores, labels)
             loss.backward()
+            candle.update_all(model)
             optimizer.step()
             if i % 16 == 0:
                 candle.prune_all(model, percentage=scheduler.compute_rate())
@@ -169,7 +207,7 @@ def train(args):
 
 def init_model(input_file=None, use_cuda=True):
     global model
-    model = ConvModel()
+    model = TinyModel()
     model.cuda()
     if input_file:
         model.load(input_file)
@@ -183,7 +221,7 @@ def main():
     parser.add_argument("--dir", type=str, default="local_data")
     parser.add_argument("--in_file", type=str, default="")
     parser.add_argument("--out_file", type=str, default="output.pt")
-    parser.add_argument("--n_epochs", type=int, default=15)
+    parser.add_argument("--n_epochs", type=int, default=10)
     args, _ = parser.parse_known_args()
     global model
     init_model(input_file=args.in_file)

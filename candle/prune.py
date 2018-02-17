@@ -32,7 +32,7 @@ class WeightProvider(object):
     def __call__(self):
         return self.weights
 
-class GradientTracker(WeightProvider):
+class InverseGradientTracker(WeightProvider):
     def __init__(self, weights, alpha=0.01):
         super().__init__(weights)
         self.grads = None
@@ -44,7 +44,7 @@ class GradientTracker(WeightProvider):
         self.grads = [self.alpha * w.grad + (1 - self.alpha) * g for w, g in zip(self.weights, self.grads)]
 
     def __call__(self):
-        return self.grads
+        return [1 / (torch.abs(g) + 1E-6) for g in self.grads]
 
 def count_prunable_params(model):
     n_params = 0
@@ -79,11 +79,21 @@ def prune_all(model, **kwargs):
         if isinstance(l, PruneLayer):
             l.prune(**kwargs)
 
+def update_all(model):
+    for l in model.modules():
+        if isinstance(l, PruneLayer):
+            l.provider.update()
+
 class PruneLayer(SerializableModule):
-    def __init__(self, config):
+    def __init__(self, config, provider=None):
         super().__init__()
         self.prune_call = _methods[config.prune_method]
         self.config = config
+        self.provider = provider
+
+    def _init(self):
+        self._init_masks()
+        self._init_provider()
 
     def _init_masks(self):
         if not self.config.use_cpu:
@@ -94,6 +104,11 @@ class PruneLayer(SerializableModule):
             self.register_parameter("_mask{}".format(i), w)
         self.activation = find_activation(self.config.prune_activation)
 
+    def _init_provider(self):
+        if self.provider is None:
+            self.provider = WeightProvider
+        self.provider = self.provider(self.weights())
+
     def weights(self):
         raise NotImplementedError
 
@@ -103,18 +118,17 @@ class PruneLayer(SerializableModule):
         return [self.activation(w) for w in self._weight_masks]
 
     def prune(self, **kwargs):
-        provider = kwargs.get("provider", WeightProvider(self.weights()))
-        self.prune_call(provider(), self.weight_masks(), **kwargs)
+        self.prune_call(self.provider(), self.weight_masks(), **kwargs)
 
     def forward(self, x):
         raise NotImplementedError
 
-class PruneConv2d(PruneLayer):
-    def __init__(self, conv_args, config, **kwargs):
+class _PruneConvNd(PruneLayer):
+    def __init__(self, conv_args, config, conv_cls, conv_fn, provider=None, **kwargs):
         super().__init__(config)
         in_channels, out_channels, kernel_size = conv_args
         self.conv_kwargs = kwargs
-        dummy_conv = nn.Conv2d(in_channels, out_channels, kernel_size, **kwargs)
+        dummy_conv = conv_cls(in_channels, out_channels, kernel_size, **kwargs)
         if not config.use_cpu:
             dummy_conv = dummy_conv.cuda()
         self.weight = dummy_conv.weight
@@ -126,7 +140,8 @@ class PruneConv2d(PruneLayer):
             kwargs["bias"] = None
         if "bias" in kwargs and kwargs["bias"]:
             del kwargs["bias"]
-        self._init_masks()
+        self.conv_fn = conv_fn
+        self._init()
 
     def weights(self):
         weights = [self.weight]
@@ -138,20 +153,32 @@ class PruneConv2d(PruneLayer):
         weight = self.weight * self.weight_masks()[0]
         if self.bias is not None:
             bias = self.bias * self.weight_masks()[1]
-            return F.conv2d(x, weight, bias, **self.conv_kwargs)
+            return self.conv_fn(x, weight, bias, **self.conv_kwargs)
         else:
-            return F.conv2d(x, weight, **self.conv_kwargs)
+            return self.conv_fn(x, weight, **self.conv_kwargs)
+
+class PruneConv3d(_PruneConvNd):
+    def __init__(self, conv_args, config, provider=None, **kwargs):
+        super().__init__(conv_args, config, nn.Conv3d, F.conv3d, provider=provider, **kwargs)
+
+class PruneConv2d(_PruneConvNd):
+    def __init__(self, conv_args, config, provider=None, **kwargs):
+        super().__init__(conv_args, config, nn.Conv2d, F.conv2d, provider=provider, **kwargs)
+
+class PruneConv1d(_PruneConvNd):
+    def __init__(self, conv_args, config, provider=None, **kwargs):
+        super().__init__(conv_args, config, nn.Conv1d, F.conv1d, provider=provider, **kwargs)
 
 class PruneLinear(PruneLayer):
-    def __init__(self, lin_args, config):
-        super().__init__(config)
+    def __init__(self, lin_args, config, **kwargs):
+        super().__init__(config, **kwargs)
         in_features, out_features = lin_args
         dummy_linear = nn.Linear(in_features, out_features)
         if not config.use_cpu:
             dummy_linear = dummy_linear.cuda()
         self.weight = dummy_linear.weight
         self.bias = dummy_linear.bias
-        self._init_masks()
+        self._init()
 
     def weights(self):
         return [self.weight, self.bias]
