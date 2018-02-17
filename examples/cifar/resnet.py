@@ -12,11 +12,11 @@ class BasicBlock(SerializableModule):
         super().__init__()
         self.layer = nn.Sequential(
             nn.BatchNorm2d(in_planes, momentum=0.9),
-            nn.ELU(),
+            nn.ReLU(inplace=True),
             candle.PruneConv2d((in_planes, planes, 3), prune_cfg, padding=1),
             nn.Dropout(dropout),
             nn.BatchNorm2d(planes, momentum=0.9),
-            nn.ELU(),
+            nn.ReLU(inplace=True),
             candle.PruneConv2d((planes, planes, 3), prune_cfg, padding=1, stride=stride)
         )
         self.skip = nn.Sequential()
@@ -36,8 +36,8 @@ class WideResNet(SerializableModule):
             blocks[0] = BasicBlock(in_planes, planes, prune_cfg, dropout=0.3, stride=stride)
             return nn.Sequential(*blocks)
         prune_cfg = candle.read_config()
-        k = 10
-        n = 7
+        k = 8
+        n = 3
         self.conv1 = candle.PruneConv2d((3, 16, 3), prune_cfg, padding=1)
         self.conv2 = make_layer(0)
         self.conv3 = make_layer(1, 2)

@@ -131,8 +131,10 @@ def train(args):
     criterion = nn.CrossEntropyLoss()
 
     train_set, test_set = SingleMnistDataset.splits(args)
-    train_loader = data.DataLoader(train_set, batch_size=100, shuffle=True, drop_last=True)
+    train_loader = data.DataLoader(train_set, batch_size=64, shuffle=True, drop_last=True)
     test_loader = data.DataLoader(test_set, batch_size=min(32, len(test_set)))
+
+    scheduler = candle.ExponentialPruningScheduler(0.8, 1.5, end_idx=10)
 
     for n_epoch in range(args.n_epochs):
         print("Epoch: {}".format(n_epoch + 1))
@@ -147,13 +149,11 @@ def train(args):
             loss.backward()
             optimizer.step()
             if i % 16 == 0:
-                if n_epoch < args.n_epochs - 2:
-                    model.conv1.prune(percentage=2 * 0.7**n_epoch)
-                    model.conv2.prune(percentage=2 * 0.7**n_epoch)
-                    model.fc1.prune(percentage=2 * 0.7**n_epoch)
+                candle.prune_all(model, percentage=scheduler.compute_rate())
                 n_unpruned = candle.count_params(model, type="unpruned")
                 accuracy = (torch.max(scores, 1)[1].view(model_in.size(0)).data == labels.data).sum() / model_in.size(0)
                 print("train accuracy: {:>10}, loss: {:>25}, unpruned: {:>10}".format(accuracy, loss.data[0], int(n_unpruned)))
+        scheduler.step()
 
     model.eval()
     n = 0
