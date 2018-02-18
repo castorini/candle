@@ -131,9 +131,9 @@ class TinyModel(SerializableModule):
         super().__init__()
         self.use_cuda = True
         prune_cfg = candle.read_config()
-        self.conv1 = candle.PruneConv2d((1, 17, 5), prune_cfg)
+        self.conv1 = candle.PruneConv2d((1, 17, 5), prune_cfg)#, provider=candle.WeightMaskGradientProvider)
         self.bn1 = nn.BatchNorm2d(17, affine=False)
-        self.conv2 = candle.PruneConv2d((17, 10, 3), prune_cfg)
+        self.conv2 = candle.PruneConv2d((17, 10, 3), prune_cfg)#, provider=candle.WeightMaskGradientProvider)
         self.bn2 = nn.BatchNorm2d(10, affine=False)
         self.pool = nn.MaxPool2d(3)
         self.fc = nn.Linear(40, 10)
@@ -146,7 +146,7 @@ class TinyModel(SerializableModule):
         return self.fc(x.view(x.size(0), -1))
 
 def train(args):
-    optimizer = torch.optim.SGD(list(filter(lambda x: x.requires_grad, model.parameters())), lr=0.01, momentum=0.9, weight_decay=0.0005)
+    optimizer = torch.optim.SGD(candle.list_params(model, train_prune=False), lr=0.01, momentum=0.9, weight_decay=0.0005)
     criterion = nn.CrossEntropyLoss()
 
     train_set, test_set = SingleMnistDataset.splits(args)
@@ -170,8 +170,11 @@ def train(args):
     # scheduler = candle.SinglePruningScheduler(99.91042349, begin_idx=2)
 
     # 1616 params, hand-crafted tiny model, 20 epochs, 98.25%
-    # 98.3%, 334 parameters
-    scheduler = candle.ExponentialPruningScheduler(0.8, 1.3, end_idx=8, begin_idx=2)
+    # 98.16%, 334 parameters with normal provider
+    # 95.22%, 143 parameters with negative gradient, 15 epochs
+    # 96.61%, 143 parameters with normal, 15 epochs
+    # scheduler = candle.ExponentialPruningScheduler(0.94, 2, end_idx=8, begin_idx=2)
+    scheduler = candle.ExponentialPruningScheduler(0.94, 3, end_idx=15, begin_idx=0)
 
     for n_epoch in range(args.n_epochs):
         print("Epoch: {}".format(n_epoch + 1))
@@ -187,8 +190,11 @@ def train(args):
             candle.update_all(model)
             optimizer.step()
             if i % 16 == 0:
-                candle.prune_all(model, percentage=scheduler.compute_rate())
                 n_unpruned = candle.count_params(model, type="unpruned")
+                if n_unpruned >= 115:
+                    candle.prune_all(model, percentage=scheduler.compute_rate())
+                if n_unpruned <= 80:
+                    candle.remove_activations(model)
                 accuracy = (torch.max(scores, 1)[1].view(model_in.size(0)).data == labels.data).sum() / model_in.size(0)
                 print("train accuracy: {:>10}, loss: {:>25}, unpruned: {:>10}".format(accuracy, loss.data[0], int(n_unpruned)))
         scheduler.step()
@@ -207,7 +213,7 @@ def train(args):
 
 def init_model(input_file=None, use_cuda=True):
     global model
-    model = TinyModel()
+    model = ConvModel()
     model.cuda()
     if input_file:
         model.load(input_file)

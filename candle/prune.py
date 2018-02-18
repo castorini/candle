@@ -11,30 +11,79 @@ def prune_magnitude(weights, weight_masks, **kwargs):
     for weight, weight_mask in zip(weights, weight_masks):
         _, indices = torch.sort(torch.abs(weight).view(-1))
         ne0_indices = indices[weight_mask.view(-1)[indices] != 0]
-        length = int(ne0_indices.size(0) * percentage / 100)
+        length = int(np.ceil(ne0_indices.size(0) * percentage / 100))
         indices = ne0_indices[:length]
-        weight_mask.view(-1)[indices] = 0
+        if indices.size(0) > 0:
+            weight_mask.data.view(-1)[indices.data] = 0
 
-class ThreshTanh(nn.Module):
-    def __init__(self):
+class CliffFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, alpha):
+        ctx.save_for_backward(x, alpha)
+        return x
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, alpha = ctx.saved_variables
+        grad_output[grad_output > 0] *= alpha
+        return grad_output * x, None
+
+cliff = CliffFunction.apply
+
+class ReLUCliff(SerializableModule):
+    def __init__(self, alpha=1):
         super().__init__()
+        self.alpha = Variable(torch.Tensor([alpha]).cuda(), requires_grad=False)
 
     def forward(self, x):
-        return F.threshold(F.tanh(x), 0, 0)
+        return cliff(x, self.alpha)
 
 class WeightProvider(object):
-    def __init__(self, weights):
-        self.weights = weights
+    def __init__(self, layer, average=True):
+        self.weights = layer.weights()
+        self.average = average
+        self._reset()
+
+    def _reset(self):
+        if self.average:
+            self.sum_weights = [0] * len(self.weights)
 
     def update(self):
-        pass
+        if self.average:
+            self.sum_weights = [sw + w for w, sw in zip(self.weights, self.sum_weights)]
 
     def __call__(self):
-        return self.weights
+        if self.average:
+            weights = self.sum_weights
+            self._reset()
+            return weights
+        else:
+            return self.weights
+
+class WeightMaskGradientProvider(WeightProvider):
+    def __init__(self, layer, negative=True):
+        super().__init__(layer)
+        self.weight_masks = layer.weight_masks()
+        self.negative = negative
+        self._reset()
+
+    def _reset(self):
+        self.grads = [0] * len(self.weight_masks)
+        self.count = 0
+
+    def update(self):
+        self.grads = [g + w.grad for w, g in zip(self.weights, self.grads)]
+        self.count += 1
+
+    def __call__(self):
+        sign = -1 if self.negative else 1
+        grads = [sign * g / self.count for g in self.grads]
+        self._reset()
+        return grads
 
 class InverseGradientTracker(WeightProvider):
-    def __init__(self, weights, alpha=0.01):
-        super().__init__(weights)
+    def __init__(self, layer, alpha=0.01):
+        super().__init__(layer)
         self.grads = None
         self.alpha = alpha
 
@@ -46,20 +95,29 @@ class InverseGradientTracker(WeightProvider):
     def __call__(self):
         return [1 / (torch.abs(g) + 1E-6) for g in self.grads]
 
+def list_params(model, train_prune=False):
+    params = []
+    for param in model.parameters():
+        if not param.requires_grad:
+            continue
+        if isinstance(param, WeightMaskParameter) and train_prune:
+            params.append(param)
+        elif not isinstance(param, WeightMaskParameter):
+            params.append(param)
+    return params
+
 def count_prunable_params(model):
     n_params = 0
-    for m in model.modules():
-        if isinstance(m, PruneLayer):
-            for w in m.weight_masks():
-                n_params += w.view(-1).size(0).data.cpu()[0]
+    for m in list_prune_layers(model):
+        for w in m.weight_masks():
+            n_params += w.view(-1).size(0).data.cpu()[0]
     return n_params
 
 def count_unpruned_params(model):
     n_params = 0
-    for m in model.modules():
-        if isinstance(m, PruneLayer):
-            for w in m.weight_masks():
-                n_params += w.sum().data.cpu()[0]
+    for m in list_prune_layers(model):
+        for w in m.weight_masks():
+            n_params += w.sum().data.cpu()[0]
     return n_params
 
 def count_params(model, type="prunable"):
@@ -68,21 +126,41 @@ def count_params(model, type="prunable"):
     elif type == "unpruned":
         return count_unpruned_params(model)
 
+def list_prune_layers(model):
+    for m in model.modules():
+        if isinstance(m, PruneLayer):
+            yield m
+
+def normalize_masks(model):
+    for m in list_prune_layers(model):
+        for w in m.weight_masks():
+            w.data.clamp_(0, 1).round_()
+
 def find_activation(name):
-    if name == "thresh_tanh":
-        return ThreshTanh()
+    if name == "cliff":
+        return ReLUCliff()
     else:
         return None
 
 def prune_all(model, **kwargs):
-    for l in model.modules():
-        if isinstance(l, PruneLayer):
-            l.prune(**kwargs)
+    for l in list_prune_layers(model):
+        l.prune(**kwargs)
 
 def update_all(model):
-    for l in model.modules():
-        if isinstance(l, PruneLayer):
-            l.provider.update()
+    for l in list_prune_layers(model):
+        l.provider.update()
+
+def remove_activations(model):
+    for l in list_prune_layers(model):
+        l.activation = None
+
+def restore_activations(model):
+    for l in list_prune_layers(model):
+        l.activation = find_activation(l.config.prune_activation)
+
+class WeightMaskParameter(nn.Parameter):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
 
 class PruneLayer(SerializableModule):
     def __init__(self, config, provider=None):
@@ -97,9 +175,11 @@ class PruneLayer(SerializableModule):
 
     def _init_masks(self):
         if not self.config.use_cpu:
-            self._weight_masks = [nn.Parameter(torch.ones(*w.size()).cuda(), requires_grad=False) for w in self.weights()]
+            self._weight_masks = [WeightMaskParameter(torch.ones(*w.size()).cuda(),
+                requires_grad=self.config.prune_trainable) for w in self.weights()]
         else:
-            self._weight_masks = [nn.Parameter(torch.ones(*w.size()), requires_grad=False) for w in self.weights()]
+            self._weight_masks = [WeightMaskParameter(torch.ones(*w.size()),
+                requires_grad=self.config.prune_trainable) for w in self.weights()]
         for i, w in enumerate(self._weight_masks):
             self.register_parameter("_mask{}".format(i), w)
         self.activation = find_activation(self.config.prune_activation)
@@ -107,7 +187,7 @@ class PruneLayer(SerializableModule):
     def _init_provider(self):
         if self.provider is None:
             self.provider = WeightProvider
-        self.provider = self.provider(self.weights())
+        self.provider = self.provider(self)
 
     def weights(self):
         raise NotImplementedError
