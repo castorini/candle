@@ -88,10 +88,10 @@ class DNNModel(SerializableModule):
     def __init__(self):
         super().__init__()
         self.use_cuda = True
-        prune_cfg = candle.read_config()
-        self.fc1 = candle.PruneLinear((784, 2048), prune_cfg)
-        self.fc2 = candle.PruneLinear((2048, 1024), prune_cfg)
-        self.fc3 = nn.Linear(1024, 10)
+        ctx = candle.Context(candle.read_config())
+        self.fc1 = ctx.pruned(nn.Linear(784, 800))
+        self.fc2 = ctx.pruned(nn.Linear(800, 800))
+        self.fc3 = nn.Linear(800, 10)
         self.dropout = nn.Dropout(0.5)
 
     def forward(self, x):
@@ -104,14 +104,14 @@ class ConvModel(SerializableModule):
     def __init__(self):
         super().__init__()
         self.use_cuda = True
-        prune_cfg = candle.read_config()
-        self.conv1 = candle.PruneConv2d((1, 64, 5), prune_cfg)
+        ctx = candle.Context(candle.read_config())
+        self.conv1 = ctx.pruned(ctx.pruned(nn.Conv2d(1, 64, 5)))
         self.bn1 = nn.BatchNorm2d(64, affine=False)
-        self.conv2 = candle.PruneConv2d((64, 96, 5), prune_cfg)
+        self.conv2 = ctx.pruned(ctx.pruned(nn.Conv2d(64, 96, 5)))
         self.bn2 = nn.BatchNorm2d(96, affine=False)
         self.pool = nn.MaxPool2d(2)
         self.dropout = nn.Dropout(0.6)
-        self.fc1 = candle.PruneLinear((16 * 96, 1024), prune_cfg)
+        self.fc1 = ctx.pruned(ctx.pruned(nn.Linear(16 * 96, 1024)))
         self.fc2 = nn.Linear(1024, 10)
 
     def encode(self, x):
@@ -130,13 +130,13 @@ class TinyModel(SerializableModule):
     def __init__(self):
         super().__init__()
         self.use_cuda = True
-        prune_cfg = candle.read_config()
-        self.conv1 = candle.PruneConv2d((1, 17, 5), prune_cfg)#, provider=candle.WeightMaskGradientProvider)
+        ctx = candle.Context(candle.read_config())
+        self.conv1 = ctx.binarized(ctx.pruned(nn.Conv2d(1, 17, 5)))
         self.bn1 = nn.BatchNorm2d(17, affine=False)
-        self.conv2 = candle.PruneConv2d((17, 10, 3), prune_cfg)#, provider=candle.WeightMaskGradientProvider)
+        self.conv2 = ctx.binarized(ctx.pruned(nn.Conv2d(17, 10, 3)))
         self.bn2 = nn.BatchNorm2d(10, affine=False)
         self.pool = nn.MaxPool2d(3)
-        self.fc = nn.Linear(40, 10)
+        self.fc = ctx.pruned(nn.Linear(40, 10))
 
     def forward(self, x):
         x = x.unsqueeze(1)
@@ -146,35 +146,16 @@ class TinyModel(SerializableModule):
         return self.fc(x.view(x.size(0), -1))
 
 def train(args):
-    optimizer = torch.optim.SGD(candle.list_params(model, train_prune=False), lr=0.01, momentum=0.9, weight_decay=0.0005)
+    params = candle.list_params(model, train_prune=False)
+    optimizer = torch.optim.SGD(params, lr=0.01, momentum=0.9, weight_decay=0.0005)
     criterion = nn.CrossEntropyLoss()
 
     train_set, test_set = SingleMnistDataset.splits(args)
     train_loader = data.DataLoader(train_set, batch_size=64, shuffle=True, drop_last=True)
     test_loader = data.DataLoader(test_set, batch_size=min(32, len(test_set)))
 
-    # 99.1 inverse grad, 99.4 weight track normal (both 85.461K params), 99.37 none (1729248M params)
-    # 99.17 single prune after 4th epoch (85K params)
-    # 99.1 single prune at 0th epoch (85K params)
-    # scheduler = candle.ExponentialPruningScheduler(0.7, 2, end_idx=6, begin_idx=2) 
-    # scheduler = candle.SinglePruningScheduler(95.057909565, begin_idx=0)
-
-    # 15719 params, 99.22%, 0.9% of model
-    # 97.96 for single prune at 2nd epoch
-    # scheduler = candle.ExponentialPruningScheduler(0.9, 1.4, end_idx=10, begin_idx=2)
-    # scheduler = candle.SinglePruningScheduler(99.090992153, begin_idx=2)
-
-    # 1549 params, 98.12%, 0.09% of model, 20 epochs
-    # 1552 params, single prune at 2nd epoch, 72%
-    # scheduler = candle.ExponentialPruningScheduler(0.92, 1.45, end_idx=16, begin_idx=2)
-    # scheduler = candle.SinglePruningScheduler(99.91042349, begin_idx=2)
-
-    # 1616 params, hand-crafted tiny model, 20 epochs, 98.25%
-    # 98.16%, 334 parameters with normal provider
-    # 95.22%, 143 parameters with negative gradient, 15 epochs
-    # 96.61%, 143 parameters with normal, 15 epochs
-    # scheduler = candle.ExponentialPruningScheduler(0.94, 2, end_idx=8, begin_idx=2)
-    scheduler = candle.ExponentialPruningScheduler(0.94, 3, end_idx=15, begin_idx=0)
+    scheduler = candle.ExponentialScheduler(0.9, 1, end_idx=5, begin_idx=11110)
+    qloss_fn = candle.LogisticFunction.interpolated(0, 10 * len(train_loader), 0, 1)
 
     for n_epoch in range(args.n_epochs):
         print("Epoch: {}".format(n_epoch + 1))
@@ -185,19 +166,22 @@ def train(args):
             model_in = Variable(model_in.cuda(), requires_grad=False)
             labels = Variable(labels.cuda(), requires_grad=False)
             scores = model(model_in)
-            loss = criterion(scores, labels)
+            qloss = 0#qloss_fn.next() * (1E-3 - 5E-5) + 5E-5
+            loss = criterion(scores, labels) + candle.quantized_loss(params, qloss)
             loss.backward()
             candle.update_all(model)
             optimizer.step()
             if i % 16 == 0:
                 n_unpruned = candle.count_params(model, type="unpruned")
-                if n_unpruned >= 115:
+                if n_unpruned >= 15719:
                     candle.prune_all(model, percentage=scheduler.compute_rate())
-                if n_unpruned <= 80:
+                if n_unpruned <= 334:
                     candle.remove_activations(model)
                 accuracy = (torch.max(scores, 1)[1].view(model_in.size(0)).data == labels.data).sum() / model_in.size(0)
-                print("train accuracy: {:>10}, loss: {:>25}, unpruned: {:>10}".format(accuracy, loss.data[0], int(n_unpruned)))
+                print("train accuracy: {:>10}, loss: {:>25}, unpruned: {:>10}, qloss: {}".format(accuracy, 
+                    loss.data[0], int(n_unpruned), qloss))
         scheduler.step()
+        model.save(args.out_file)
 
     model.eval()
     n = 0
@@ -213,7 +197,7 @@ def train(args):
 
 def init_model(input_file=None, use_cuda=True):
     global model
-    model = ConvModel()
+    model = TinyModel()
     model.cuda()
     if input_file:
         model.load(input_file)

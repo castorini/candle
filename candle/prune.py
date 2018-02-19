@@ -8,10 +8,13 @@ from .model import SerializableModule
 
 def prune_magnitude(weights, weight_masks, **kwargs):
     percentage = kwargs.get("percentage", 50)
+    min_length = kwargs.get("min_length", 0)
     for weight, weight_mask in zip(weights, weight_masks):
         _, indices = torch.sort(torch.abs(weight).view(-1))
         ne0_indices = indices[weight_mask.view(-1)[indices] != 0]
-        length = int(np.ceil(ne0_indices.size(0) * percentage / 100))
+        if ne0_indices.size(0) < min_length:
+            continue
+        length = int(ne0_indices.size(0) * percentage / 100)
         indices = ne0_indices[:length]
         if indices.size(0) > 0:
             weight_mask.data.view(-1)[indices.data] = 0
@@ -60,6 +63,14 @@ class WeightProvider(object):
         else:
             return self.weights
 
+class RandomWeightProvider(WeightProvider):
+    def __init__(self, layer):
+        super().__init__(layer)
+
+    def __call__(self):
+        weights = [w.clone() for w in self.weights]
+        return [w.uniform_() for w in weights]
+
 class WeightMaskGradientProvider(WeightProvider):
     def __init__(self, layer, negative=True):
         super().__init__(layer)
@@ -68,7 +79,7 @@ class WeightMaskGradientProvider(WeightProvider):
         self._reset()
 
     def _reset(self):
-        self.grads = [0] * len(self.weight_masks)
+        self.grads = [0] * len(self.weights)
         self.count = 0
 
     def update(self):
@@ -131,10 +142,13 @@ def list_prune_layers(model):
         if isinstance(m, PruneLayer):
             yield m
 
-def normalize_masks(model):
+def normalize_masks(model, soft=False):
     for m in list_prune_layers(model):
         for w in m.weight_masks():
-            w.data.clamp_(0, 1).round_()
+            if soft:
+                w.data.clamp_(0, 1)
+            else:
+                w.data.clamp_(0, 1).round_()
 
 def find_activation(name):
     if name == "cliff":
@@ -163,11 +177,13 @@ class WeightMaskParameter(nn.Parameter):
         super().__init__(*args, **kwargs)
 
 class PruneLayer(SerializableModule):
-    def __init__(self, config, provider=None):
+    def __init__(self, config, provider=None, min_length=0):
         super().__init__()
         self.prune_call = _methods[config.prune_method]
         self.config = config
         self.provider = provider
+        self.hook = None
+        self.min_length = min_length
 
     def _init(self):
         self._init_masks()
@@ -189,8 +205,23 @@ class PruneLayer(SerializableModule):
             self.provider = WeightProvider
         self.provider = self.provider(self)
 
+    def register_parameter_hook(self, hook):
+        self.hook = hook
+
     def weights(self):
         raise NotImplementedError
+
+    def hook_weight(self, weight):
+        if not self.hook:
+            return weight
+        return self.hook(weight)
+
+    def apply_hook(self):
+        for w in self.weights():
+            w.data = self.hook_weight(w.data)
+
+    def hooked_weights(self):
+        return [self.hook_weight(w) for w in weights]
 
     def weight_masks(self):
         if self.activation is None:
@@ -198,14 +229,14 @@ class PruneLayer(SerializableModule):
         return [self.activation(w) for w in self._weight_masks]
 
     def prune(self, **kwargs):
-        self.prune_call(self.provider(), self.weight_masks(), **kwargs)
+        self.prune_call(self.provider(), self.weight_masks(), min_length=self.min_length, **kwargs)
 
     def forward(self, x):
         raise NotImplementedError
 
 class _PruneConvNd(PruneLayer):
-    def __init__(self, conv_args, config, conv_cls, conv_fn, provider=None, **kwargs):
-        super().__init__(config)
+    def __init__(self, conv_args, config, conv_cls, conv_fn, provider=None, min_length=0, **kwargs):
+        super().__init__(config, provider, min_length)
         in_channels, out_channels, kernel_size = conv_args
         self.conv_kwargs = kwargs
         dummy_conv = conv_cls(in_channels, out_channels, kernel_size, **kwargs)
@@ -230,24 +261,27 @@ class _PruneConvNd(PruneLayer):
         return weights
 
     def forward(self, x):
-        weight = self.weight * self.weight_masks()[0]
+        weight = self.hook_weight(self.weight) * self.weight_masks()[0]
         if self.bias is not None:
-            bias = self.bias * self.weight_masks()[1]
+            bias = self.hook_weight(self.bias) * self.weight_masks()[1]
             return self.conv_fn(x, weight, bias, **self.conv_kwargs)
         else:
             return self.conv_fn(x, weight, **self.conv_kwargs)
 
 class PruneConv3d(_PruneConvNd):
-    def __init__(self, conv_args, config, provider=None, **kwargs):
-        super().__init__(conv_args, config, nn.Conv3d, F.conv3d, provider=provider, **kwargs)
+    def __init__(self, conv_args, config, provider=None, min_length=0, **kwargs):
+        super().__init__(conv_args, config, nn.Conv3d, F.conv3d, provider=provider, min_length=min_length, **kwargs)
 
 class PruneConv2d(_PruneConvNd):
-    def __init__(self, conv_args, config, provider=None, **kwargs):
-        super().__init__(conv_args, config, nn.Conv2d, F.conv2d, provider=provider, **kwargs)
+    def __init__(self, conv_args, config, provider=None, min_length=0, **kwargs):
+        super().__init__(conv_args, config, nn.Conv2d, F.conv2d, provider=provider, min_length=min_length, **kwargs)
 
 class PruneConv1d(_PruneConvNd):
-    def __init__(self, conv_args, config, provider=None, **kwargs):
-        super().__init__(conv_args, config, nn.Conv1d, F.conv1d, provider=provider, **kwargs)
+    def __init__(self, conv_args, config, provider=None, min_length=0, **kwargs):
+        super().__init__(conv_args, config, nn.Conv1d, F.conv1d, provider=provider, min_length=min_length, **kwargs)
+
+class PruneLSTM(PruneLayer):
+    pass
 
 class PruneLinear(PruneLayer):
     def __init__(self, lin_args, config, **kwargs):
@@ -264,8 +298,8 @@ class PruneLinear(PruneLayer):
         return [self.weight, self.bias]
 
     def forward(self, x):
-        weight = self.weight * self.weight_masks()[0]
-        bias = self.bias * self.weight_masks()[1]
+        weight = self.hook_weight(self.weight) * self.weight_masks()[0]
+        bias = self.hook_weight(self.bias) * self.weight_masks()[1]
         return F.linear(x, weight, bias)
 
 _methods = dict(magnitude=prune_magnitude)
