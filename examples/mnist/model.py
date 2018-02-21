@@ -104,14 +104,16 @@ class ConvModel(SerializableModule):
     def __init__(self):
         super().__init__()
         self.use_cuda = True
-        ctx = candle.Context(candle.read_config())
-        self.conv1 = ctx.pruned(ctx.pruned(nn.Conv2d(1, 64, 5)))
+        ctx = candle.Context(candle.read_config())#, provider=candle.OptimalBrainDamageApproximator)
+        self.conv1 = ctx.pruned(nn.Conv2d(1, 64, 5))
         self.bn1 = nn.BatchNorm2d(64, affine=False)
-        self.conv2 = ctx.pruned(ctx.pruned(nn.Conv2d(64, 96, 5)))
+        self.conv2 = ctx.pruned(nn.Conv2d(64, 96, 5))
         self.bn2 = nn.BatchNorm2d(96, affine=False)
         self.pool = nn.MaxPool2d(2)
         self.dropout = nn.Dropout(0.6)
-        self.fc1 = ctx.pruned(ctx.pruned(nn.Linear(16 * 96, 1024)))
+        # self.bn3 = nn.BatchNorm1d(16 * 96)
+        self.fc1 = ctx.pruned(nn.Linear(16 * 96, 1024))
+        # self.bn4 = nn.BatchNorm1d(1024)
         self.fc2 = nn.Linear(1024, 10)
 
     def encode(self, x):
@@ -123,20 +125,22 @@ class ConvModel(SerializableModule):
     def forward(self, x):
         x = self.encode(x)
         x = x.view(x.size(0), -1)
+        # x = self.bn3(x)
         x = self.dropout(F.relu(self.fc1(x)))
+        # x = self.bn4(x)
         return self.fc2(x)
 
 class TinyModel(SerializableModule):
     def __init__(self):
         super().__init__()
         self.use_cuda = True
-        ctx = candle.Context(candle.read_config())
-        self.conv1 = ctx.binarized(ctx.pruned(nn.Conv2d(1, 17, 5)))
+        ctx = candle.Context(candle.read_config(), provider=candle.OptimalBrainDamageApproximator)
+        self.conv1 = ctx.pruned(nn.Conv2d(1, 17, 5))
         self.bn1 = nn.BatchNorm2d(17, affine=False)
-        self.conv2 = ctx.binarized(ctx.pruned(nn.Conv2d(17, 10, 3)))
+        self.conv2 = ctx.pruned(nn.Conv2d(17, 10, 3))
         self.bn2 = nn.BatchNorm2d(10, affine=False)
         self.pool = nn.MaxPool2d(3)
-        self.fc = ctx.pruned(nn.Linear(40, 10))
+        self.fc = nn.Linear(40, 10)
 
     def forward(self, x):
         x = x.unsqueeze(1)
@@ -148,14 +152,18 @@ class TinyModel(SerializableModule):
 def train(args):
     params = candle.list_params(model, train_prune=False)
     optimizer = torch.optim.SGD(params, lr=0.01, momentum=0.9, weight_decay=0.0005)
+    # optimizer = torch.optim.Adam(params, lr=0.01, weight_decay=0.0005)
     criterion = nn.CrossEntropyLoss()
 
     train_set, test_set = SingleMnistDataset.splits(args)
     train_loader = data.DataLoader(train_set, batch_size=64, shuffle=True, drop_last=True)
     test_loader = data.DataLoader(test_set, batch_size=min(32, len(test_set)))
 
-    scheduler = candle.ExponentialScheduler(0.9, 1, end_idx=5, begin_idx=11110)
+    # scheduler = candle.ExponentialScheduler(0.9, 0.5, end_idx=5, begin_idx=0) # 99.53% off test.pt, 500k params!
+    # scheduler = candle.ExponentialScheduler(0.92, 1.45, end_idx=16, begin_idx=2)
+    scheduler = candle.ExponentialScheduler(0.9, 1.3, end_idx=6, begin_idx=3)
     qloss_fn = candle.LogisticFunction.interpolated(0, 10 * len(train_loader), 0, 1)
+    candle.apply_all_hooks(model)
 
     for n_epoch in range(args.n_epochs):
         print("Epoch: {}".format(n_epoch + 1))
@@ -166,17 +174,17 @@ def train(args):
             model_in = Variable(model_in.cuda(), requires_grad=False)
             labels = Variable(labels.cuda(), requires_grad=False)
             scores = model(model_in)
-            qloss = 0#qloss_fn.next() * (1E-3 - 5E-5) + 5E-5
+            qloss = 0#qloss_fn.next() * (1E-6 - 5E-8) + 5E-8
             loss = criterion(scores, labels) + candle.quantized_loss(params, qloss)
             loss.backward()
             candle.update_all(model)
             optimizer.step()
             if i % 16 == 0:
                 n_unpruned = candle.count_params(model, type="unpruned")
-                if n_unpruned >= 15719:
-                    candle.prune_all(model, percentage=scheduler.compute_rate())
-                if n_unpruned <= 334:
-                    candle.remove_activations(model)
+                if n_unpruned > 143:
+                    candle.prune_all(model, percentage=scheduler.compute_rate(), loss=criterion(model(model_in), labels))
+                # if n_unpruned <= 334:
+                #     candle.remove_activations(model)
                 accuracy = (torch.max(scores, 1)[1].view(model_in.size(0)).data == labels.data).sum() / model_in.size(0)
                 print("train accuracy: {:>10}, loss: {:>25}, unpruned: {:>10}, qloss: {}".format(accuracy, 
                     loss.data[0], int(n_unpruned), qloss))
