@@ -1,3 +1,4 @@
+# Adapted various parts from https://github.com/MatthieuCourbariaux/BinaryNet/blob/master/Train-time/binary_net.py
 from torch.autograd import Variable
 import torch
 import torch.nn as nn
@@ -7,11 +8,17 @@ import numpy as np
 from .model import SerializableModule
 from .provider import WeightProvider
 
+def prune_sort(weights, weight_masks, **kwargs):
+    kwargs["use_abs"] = False
+    prune_magnitude(weights, weight_masks, **kwargs)
+
 def prune_magnitude(weights, weight_masks, **kwargs):
     percentage = kwargs.get("percentage", 50)
     min_length = kwargs.get("min_length", 0)
+    do_abs = kwargs.get("use_abs", True)
     for weight, weight_mask in zip(weights, weight_masks):
-        _, indices = torch.sort(torch.abs(weight).view(-1))
+        w = torch.abs(weight) if do_abs else weight
+        _, indices = torch.sort(w.view(-1))
         ne0_indices = indices[weight_mask.view(-1)[indices] != 0]
         if ne0_indices.size(0) < min_length:
             continue
@@ -92,6 +99,15 @@ def find_activation(name):
     else:
         return None
 
+def scale_all_lr(model):
+    for l in list_prune_layers(model):
+        l.apply_grad_lr()
+
+def clip_all_binary(model):
+    for l in list_prune_layers(model):
+        if l.binary:
+            l.clip_weights(-1, 1)
+
 def prune_all(model, **kwargs):
     for l in list_prune_layers(model):
         l.prune(**kwargs)
@@ -116,16 +132,37 @@ class WeightMaskParameter(nn.Parameter):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
+# Lifted from PT
+def compute_fans(tensor):
+    dimensions = tensor.ndimension()
+    if dimensions < 2:
+        raise ValueError("Fan in and fan out can not be computed for tensor with less than 2 dimensions")
+
+    if dimensions == 2:  # Linear
+        fan_in = tensor.size(1)
+        fan_out = tensor.size(0)
+    else:
+        num_input_fmaps = tensor.size(1)
+        num_output_fmaps = tensor.size(0)
+        receptive_field_size = 1
+        if tensor.dim() > 2:
+            receptive_field_size = tensor[0][0].numel()
+        fan_in = num_input_fmaps * receptive_field_size
+        fan_out = num_output_fmaps * receptive_field_size
+
+    return fan_in, fan_out
+
 class PruneLayer(SerializableModule):
-    def __init__(self, config, provider=None, min_length=0, prunable=True):
+    def __init__(self, config, provider=None, prunable=True):
         super().__init__()
         self.prune_call = _methods[config.prune_method]
         self.config = config
         self.provider = provider
         self.hook = None
         self.mutable_forward_hook = None
-        self.min_length = min_length
+        self.binary = False
         self.prunable = prunable
+        self._w_scales = None
 
     def _init(self):
         self._init_masks()
@@ -141,6 +178,19 @@ class PruneLayer(SerializableModule):
         for i, w in enumerate(self._weight_masks):
             self.register_parameter("_mask{}".format(i), w)
         self.activation = find_activation(self.config.prune_activation)
+
+    def apply_grad_lr(self):
+        if not self._w_scales:
+            self._w_scales = []
+            for weight in self.weights():
+                try:
+                    n_in, n_out = compute_fans(weight.data)
+                except ValueError:
+                    self._w_scales.append(1)
+                    continue
+                self._w_scales.append(1 / np.sqrt(1.5 / (n_in + n_out)))
+        for weight, scale in zip(self.weights(), self._w_scales):
+            weight.grad.mul_(scale)
 
     def _init_provider(self):
         if self.provider is None:
@@ -176,10 +226,14 @@ class PruneLayer(SerializableModule):
     def prune(self, loss=None, **kwargs):
         if not self.prunable:
             return
-        self.prune_call(self.provider(loss), self.weight_masks(), min_length=self.min_length, **kwargs)
+        self.prune_call(self.provider(loss), self.weight_masks(), **kwargs)
 
     def on_forward(self, *args, **kwargs):
         raise NotImplementedError
+
+    def clip_weights(self, a, b):
+        for weight in self.weights():
+            weight.data.clamp_(a, b)
 
     def forward(self, *args, **kwargs):
         out = self.on_forward(*args, **kwargs)
@@ -237,9 +291,8 @@ class PruneRNN(PruneLayer):
         return val
 
 class _PruneConvNd(PruneLayer):
-    def __init__(self, conv_args, config, conv_cls, conv_fn, provider=None, 
-            min_length=0, prunable=False, **kwargs):
-        super().__init__(config, provider, min_length)
+    def __init__(self, conv_args, config, conv_cls, conv_fn, provider=None, prunable=False, **kwargs):
+        super().__init__(config, provider)
         in_channels, out_channels, kernel_size = conv_args
         self.conv_kwargs = kwargs
         dummy_conv = conv_cls(in_channels, out_channels, kernel_size, **kwargs)
@@ -272,16 +325,16 @@ class _PruneConvNd(PruneLayer):
             return self.conv_fn(x, weight, **self.conv_kwargs)
 
 class PruneConv3d(_PruneConvNd):
-    def __init__(self, conv_args, config, provider=None, min_length=0, **kwargs):
-        super().__init__(conv_args, config, nn.Conv3d, F.conv3d, provider=provider, min_length=min_length, **kwargs)
+    def __init__(self, conv_args, config, provider=None, **kwargs):
+        super().__init__(conv_args, config, nn.Conv3d, F.conv3d, provider=provider, **kwargs)
 
 class PruneConv2d(_PruneConvNd):
-    def __init__(self, conv_args, config, provider=None, min_length=0, **kwargs):
-        super().__init__(conv_args, config, nn.Conv2d, F.conv2d, provider=provider, min_length=min_length, **kwargs)
+    def __init__(self, conv_args, config, provider=None, **kwargs):
+        super().__init__(conv_args, config, nn.Conv2d, F.conv2d, provider=provider, **kwargs)
 
 class PruneConv1d(_PruneConvNd):
-    def __init__(self, conv_args, config, provider=None, min_length=0, **kwargs):
-        super().__init__(conv_args, config, nn.Conv1d, F.conv1d, provider=provider, min_length=min_length, **kwargs)
+    def __init__(self, conv_args, config, provider=None, **kwargs):
+        super().__init__(conv_args, config, nn.Conv1d, F.conv1d, provider=provider, **kwargs)
 
 class PruneLinear(PruneLayer):
     def __init__(self, lin_args, config, **kwargs):
@@ -302,4 +355,4 @@ class PruneLinear(PruneLayer):
         bias = self.hook_weight(self.bias) * self.weight_masks()[1]
         return F.linear(x, weight, bias)
 
-_methods = dict(magnitude=prune_magnitude)
+_methods = dict(magnitude=prune_magnitude, sort=prune_sort)

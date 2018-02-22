@@ -5,6 +5,7 @@ import random
 
 from PIL import Image
 from torch.autograd import Variable
+from torch.optim.lr_scheduler import ExponentialLR
 import cv2
 import numpy as np
 import torch
@@ -64,22 +65,23 @@ class SingleMnistDataset(data.Dataset):
             with open(lbl_set, "rb") as f:
                 content = f.read()
             lbl_sets.append(read_idx(content).astype(np.int))
-        return cls(image_sets[0], lbl_sets[0], True, **kwargs), cls(image_sets[1], lbl_sets[1], False, **kwargs)
+
+        dev_images = image_sets[0][-2500:]
+        image_sets[0] = image_sets[0][:-2500]
+        image_sets.append(dev_images)
+        dev_lbls = lbl_sets[0][-2500:]
+        lbl_sets[0] = lbl_sets[0][:-2500]
+        lbl_sets.append(dev_lbls)
+        return cls(image_sets[0], lbl_sets[0], True, **kwargs), cls(image_sets[2], lbl_sets[2], False, **kwargs), \
+            cls(image_sets[1], lbl_sets[1], False, **kwargs)
 
     def __getitem__(self, index):
         lbl = self.clean_labels[index]
         img = self.clean_images[index]
-        if random.random() < 0.5 and self.is_training:
-            arr = np.array(img)
-            arr = np.roll(arr, random.randint(-2, 2), 0)
-            arr = np.roll(arr, random.randint(-2, 2), 1)
-            arr = (arr - np.mean(arr)) / np.sqrt(np.var(arr) + 1E-6)
-            arr = arr.astype(np.float32)
-            return torch.from_numpy(arr), lbl
-        else:
-            arr = np.array(img)
-            arr = (arr - np.mean(arr)) / np.sqrt(np.var(arr) + 1E-6)
-            return torch.from_numpy(arr.astype(np.float32)), lbl
+        arr = np.array(img)
+        arr = arr.astype(np.float32)
+        arr = (arr / 255) * 2 - 1
+        return torch.from_numpy(arr), lbl
 
     def __len__(self):
         return len(self.clean_images)
@@ -88,56 +90,63 @@ class DNNModel(SerializableModule):
     def __init__(self):
         super().__init__()
         self.use_cuda = True
+        def make_hidden(n_in, n_out, dropout=0.5):
+            return nn.Sequential(
+                ctx.binarized(nn.Linear(n_in, n_out)),
+                nn.BatchNorm1d(n_out),
+                candle.BinaryTanh(),
+                nn.Dropout(dropout))
         ctx = candle.Context(candle.read_config())
-        self.fc1 = ctx.pruned(nn.Linear(784, 800))
-        self.fc2 = ctx.pruned(nn.Linear(800, 800))
-        self.fc3 = nn.Linear(800, 10)
-        self.dropout = nn.Dropout(0.5)
+        n_units = 4096
+        mod_list = [make_hidden(784, n_units, dropout=0.2)]
+        mod_list.extend(make_hidden(n_units, n_units) for _ in range(3))
+        mod_list.append(ctx.binarized(nn.Linear(n_units, 10)))
+        self.layers = nn.ModuleList(mod_list)
 
     def forward(self, x):
         x = x.view(x.size(0), -1)
-        x = F.relu(self.dropout(self.fc1(x)))
-        x = F.relu(self.dropout(self.fc2(x)))
-        return self.fc3(x)
+        for l in self.layers:
+            x = l(x)
+        return x
 
 class ConvModel(SerializableModule):
     def __init__(self):
         super().__init__()
         self.use_cuda = True
-        ctx = candle.Context(candle.read_config())#, provider=candle.OptimalBrainDamageApproximator)
-        self.conv1 = ctx.pruned(nn.Conv2d(1, 64, 5))
-        self.bn1 = nn.BatchNorm2d(64, affine=False)
-        self.conv2 = ctx.pruned(nn.Conv2d(64, 96, 5))
-        self.bn2 = nn.BatchNorm2d(96, affine=False)
+        ctx = candle.Context(candle.read_config())
+        self.conv1 = ctx.binarized(nn.Conv2d(1, 64, 5))
+        self.bn1 = nn.BatchNorm2d(64, affine=True)
+        self.conv2 = ctx.binarized(nn.Conv2d(64, 96, 5))
+        self.bn2 = nn.BatchNorm2d(96, affine=True)
         self.pool = nn.MaxPool2d(2)
         self.dropout = nn.Dropout(0.6)
-        # self.bn3 = nn.BatchNorm1d(16 * 96)
-        self.fc1 = ctx.pruned(nn.Linear(16 * 96, 1024))
-        # self.bn4 = nn.BatchNorm1d(1024)
-        self.fc2 = nn.Linear(1024, 10)
+        self.bn3 = nn.BatchNorm1d(16 * 96)
+        self.fc1 = ctx.binarized(nn.Linear(16 * 96, 1024))
+        self.bn4 = nn.BatchNorm1d(1024)
+        self.fc2 = ctx.binarized(nn.Linear(1024, 10))
 
     def encode(self, x):
         x = x.unsqueeze(1)
-        x = self.pool(self.bn1(F.relu(self.conv1(x))))
-        x = self.pool(self.bn2(F.relu(self.conv2(x))))
+        x = self.pool(self.bn1(candle.binary_tanh(self.conv1(x))))
+        x = self.pool(self.bn2(candle.binary_tanh(self.conv2(x))))
         return x
 
     def forward(self, x):
         x = self.encode(x)
         x = x.view(x.size(0), -1)
-        # x = self.bn3(x)
-        x = self.dropout(F.relu(self.fc1(x)))
-        # x = self.bn4(x)
+        x = self.bn3(x)
+        x = self.dropout(candle.binary_tanh(self.fc1(x)))
+        x = self.bn4(x)
         return self.fc2(x)
 
 class TinyModel(SerializableModule):
     def __init__(self):
         super().__init__()
         self.use_cuda = True
-        ctx = candle.Context(candle.read_config(), provider=candle.OptimalBrainDamageApproximator)
-        self.conv1 = ctx.pruned(nn.Conv2d(1, 17, 5))
+        ctx = candle.Context(candle.read_config())
+        self.conv1 = ctx.binarized(nn.Conv2d(1, 17, 5))
         self.bn1 = nn.BatchNorm2d(17, affine=False)
-        self.conv2 = ctx.pruned(nn.Conv2d(17, 10, 3))
+        self.conv2 = ctx.binarized(nn.Conv2d(17, 10, 3))
         self.bn2 = nn.BatchNorm2d(10, affine=False)
         self.pool = nn.MaxPool2d(3)
         self.fc = nn.Linear(40, 10)
@@ -151,19 +160,19 @@ class TinyModel(SerializableModule):
 
 def train(args):
     params = candle.list_params(model, train_prune=False)
-    optimizer = torch.optim.SGD(params, lr=0.01, momentum=0.9, weight_decay=0.0005)
-    # optimizer = torch.optim.Adam(params, lr=0.01, weight_decay=0.0005)
-    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(params, lr=3E-4, weight_decay=0.0005)
+    criterion = nn.MultiMarginLoss(p=2)
 
-    train_set, test_set = SingleMnistDataset.splits(args)
-    train_loader = data.DataLoader(train_set, batch_size=64, shuffle=True, drop_last=True)
+    train_set, dev_set, test_set = SingleMnistDataset.splits(args)
+    train_loader = data.DataLoader(train_set, batch_size=100, shuffle=True, drop_last=True)
+    dev_loader = data.DataLoader(dev_set, batch_size=min(32, len(dev_set)))
     test_loader = data.DataLoader(test_set, batch_size=min(32, len(test_set)))
+    lr_start = 3E-4
+    lr_fin = 1E-5
+    if args.n_epochs > 0:
+        lr_scheduler = ExponentialLR(optimizer, (lr_fin / lr_start)**(1 / args.n_epochs))
 
-    # scheduler = candle.ExponentialScheduler(0.9, 0.5, end_idx=5, begin_idx=0) # 99.53% off test.pt, 500k params!
-    # scheduler = candle.ExponentialScheduler(0.92, 1.45, end_idx=16, begin_idx=2)
-    scheduler = candle.ExponentialScheduler(0.9, 1.3, end_idx=6, begin_idx=3)
-    qloss_fn = candle.LogisticFunction.interpolated(0, 10 * len(train_loader), 0, 1)
-    candle.apply_all_hooks(model)
+    best_dev = -np.inf
 
     for n_epoch in range(args.n_epochs):
         print("Epoch: {}".format(n_epoch + 1))
@@ -174,22 +183,33 @@ def train(args):
             model_in = Variable(model_in.cuda(), requires_grad=False)
             labels = Variable(labels.cuda(), requires_grad=False)
             scores = model(model_in)
-            qloss = 0#qloss_fn.next() * (1E-6 - 5E-8) + 5E-8
-            loss = criterion(scores, labels) + candle.quantized_loss(params, qloss)
+            loss = criterion(scores, labels)
             loss.backward()
             candle.update_all(model)
+            candle.scale_all_lr(model)
             optimizer.step()
+            candle.clip_all_binary(model)
             if i % 16 == 0:
-                n_unpruned = candle.count_params(model, type="unpruned")
-                if n_unpruned > 143:
-                    candle.prune_all(model, percentage=scheduler.compute_rate(), loss=criterion(model(model_in), labels))
-                # if n_unpruned <= 334:
-                #     candle.remove_activations(model)
+                # n_unpruned = candle.count_params(model, type="unpruned")
+                # if n_unpruned...:
+                #     candle.prune_all(model, percentage=scheduler.compute_rate())
                 accuracy = (torch.max(scores, 1)[1].view(model_in.size(0)).data == labels.data).sum() / model_in.size(0)
-                print("train accuracy: {:>10}, loss: {:>25}, unpruned: {:>10}, qloss: {}".format(accuracy, 
-                    loss.data[0], int(n_unpruned), qloss))
-        scheduler.step()
-        model.save(args.out_file)
+                print("train accuracy: {:>10}, loss: {:>25}".format(accuracy, loss.data[0]))
+        accuracy = 0
+        n = 0
+        model.eval()
+        for model_in, labels in dev_loader:
+            model_in = Variable(model_in.cuda(), volatile=True)
+            labels = Variable(labels.cuda(), volatile=True)
+            scores = model(model_in)
+            accuracy += (torch.max(scores, 1)[1].view(model_in.size(0)).data == labels.data).sum()
+            n += model_in.size(0)
+        print("dev accuracy: {:>10}".format(accuracy / n))
+        lr_scheduler.step()
+        if accuracy > best_dev:
+            best_dev = accuracy
+            print("Saving best model...")
+            model.save(args.out_file)
 
     model.eval()
     n = 0
@@ -205,7 +225,7 @@ def train(args):
 
 def init_model(input_file=None, use_cuda=True):
     global model
-    model = TinyModel()
+    model = ConvModel()
     model.cuda()
     if input_file:
         model.load(input_file)
@@ -219,7 +239,7 @@ def main():
     parser.add_argument("--dir", type=str, default="local_data")
     parser.add_argument("--in_file", type=str, default="")
     parser.add_argument("--out_file", type=str, default="output.pt")
-    parser.add_argument("--n_epochs", type=int, default=10)
+    parser.add_argument("--n_epochs", type=int, default=40)
     args, _ = parser.parse_known_args()
     global model
     init_model(input_file=args.in_file)

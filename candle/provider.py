@@ -54,37 +54,10 @@ class WeightMaskGradientProvider(WeightProvider):
         self._reset()
         return grads
 
-class InverseGradientTracker(WeightProvider):
+class LossApproximator(WeightProvider):
     def __init__(self, layer, alpha=0.01):
-        super().__init__(layer)
-        self.grads = None
-        self.alpha = alpha
-
-    def update(self):
-        if self.grads is None:
-            self.grads = [w.grad.clone() for w in self.weights]
-        self.grads = [self.alpha * w.grad + (1 - self.alpha) * g for w, g in zip(self.weights, self.grads)]
-
-    def __call__(self, loss):
-        return [1 / (torch.abs(g) + 1E-6) for g in self.grads]
-
-class OptimalBrainDamageApproximator(WeightProvider):
-    def __init__(self, layer):
         super().__init__(layer, average=False)
 
-    def _recursive_sum(self, x):
-        s = 0
-        for elem in x:
-            if isinstance(elem, list) or isinstance(elem, tuple):
-                s = s + self._recursive_sum(elem)
-            else:
-                s = s + torch.sum(elem)
-        return s
-
-    def __call__(self, loss):
-        if loss is None:
-            raise ValueError("Loss is required for this weight provider!")
-        grads = ag.grad(loss, self.weights, create_graph=True)
-        grad_sum = self._recursive_sum(grads)
-        hessians = ag.grad(grad_sum, self.weights, create_graph=True)
-        return [h * w**2 for w, h in zip(self.weights, hessians)]
+    def __call__(self):
+        grads = [w.grad for w in self.weights]
+        return [g * w for w, g in zip(self.weights, grads)]

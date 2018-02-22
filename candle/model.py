@@ -48,13 +48,14 @@ class Context(object):
         kwargs_cpy.update(kwargs)
         return self._make_prune_module(module, **kwargs_cpy)
 
-    def binarized(self, module, binary_activations=True, **kwargs):
+    def binarized(self, module, **kwargs):
         kwargs_cpy = self.kwargs.copy()
         kwargs_cpy.update(kwargs)
         module = self._make_prune_module(module, **kwargs_cpy)
         module.register_parameter_hook(candle.binarize)
-        if binary_activations:
-            module.register_mutable_forward_hook(candle.binarize)
+        module.binary = True
+        for weight in module.weights():
+            weight.data.uniform_(-1, 1)
         return module
 
 # Adapted from https://github.com/tensorflow/tensorflow/blob/master/tensorflow/python/ops/gradients_impl.py#L924
