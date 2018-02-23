@@ -79,6 +79,9 @@ class SingleMnistDataset(data.Dataset):
         lbl = self.clean_labels[index]
         img = self.clean_images[index]
         arr = np.array(img)
+        if random.random() < 0.5 and self.is_training:
+            arr = np.roll(arr, random.randint(-2, 2), 0)
+            arr = np.roll(arr, random.randint(-2, 2), 1)
         arr = arr.astype(np.float32)
         arr = (arr / 255) * 2 - 1
         return torch.from_numpy(arr), lbl
@@ -114,29 +117,25 @@ class ConvModel(SerializableModule):
         super().__init__()
         self.use_cuda = True
         ctx = candle.Context(candle.read_config())
-        self.conv1 = ctx.binarized(nn.Conv2d(1, 64, 5))
+        self.conv1 = ctx.pruned(nn.Conv2d(1, 64, 5))
         self.bn1 = nn.BatchNorm2d(64, affine=True)
-        self.conv2 = ctx.binarized(nn.Conv2d(64, 96, 5))
+        self.conv2 = ctx.pruned(nn.Conv2d(64, 96, 5))
         self.bn2 = nn.BatchNorm2d(96, affine=True)
         self.pool = nn.MaxPool2d(2)
         self.dropout = nn.Dropout(0.6)
-        self.bn3 = nn.BatchNorm1d(16 * 96)
-        self.fc1 = ctx.binarized(nn.Linear(16 * 96, 1024))
-        self.bn4 = nn.BatchNorm1d(1024)
-        self.fc2 = ctx.binarized(nn.Linear(1024, 10))
+        self.fc1 = ctx.pruned(nn.Linear(16 * 96, 1024))
+        self.fc2 = nn.Linear(1024, 10)
 
     def encode(self, x):
         x = x.unsqueeze(1)
-        x = self.pool(self.bn1(candle.binary_tanh(self.conv1(x))))
-        x = self.pool(self.bn2(candle.binary_tanh(self.conv2(x))))
+        x = self.pool(self.bn1(F.relu(self.conv1(x))))
+        x = self.pool(self.bn2(F.relu(self.conv2(x))))
         return x
 
     def forward(self, x):
         x = self.encode(x)
         x = x.view(x.size(0), -1)
-        x = self.bn3(x)
-        x = self.dropout(candle.binary_tanh(self.fc1(x)))
-        x = self.bn4(x)
+        x = self.dropout(F.relu(self.fc1(x)))
         return self.fc2(x)
 
 class TinyModel(SerializableModule):
@@ -158,16 +157,87 @@ class TinyModel(SerializableModule):
         x = x.view(x.size(0), -1)
         return self.fc(x.view(x.size(0), -1))
 
-def train(args):
+def train_pruned(args):
+    mask_params = candle.list_params(model, masks_only=True)
+    model_params = candle.list_params(model)
+    mask_optim = torch.optim.ASGD(mask_params, lr=0.1)
+    model_optim = torch.optim.SGD(model_params, lr=5E-3, weight_decay=0.0005)
+    criterion = nn.CrossEntropyLoss()
+
+    train_set, dev_set, test_set = SingleMnistDataset.splits(args)
+    train_loader = data.DataLoader(train_set, batch_size=64, shuffle=True, drop_last=True)
+    dev_loader = data.DataLoader(dev_set, batch_size=min(32, len(dev_set)))
+    test_loader = data.DataLoader(test_set, batch_size=min(32, len(test_set)))
+
+    best_dev = -0
+    scheduler = candle.ExponentialScheduler(0.92, 1.45, end_idx=16, begin_idx=110)
+
+    for n_epoch in range(args.n_epochs):
+        print("Epoch: {}".format(n_epoch + 1))
+        model.train()
+        for i, (model_in, labels) in enumerate(train_loader):
+            model_optim.zero_grad()
+            mask_optim.zero_grad()
+
+            model_in = Variable(model_in.cuda(), requires_grad=False)
+            labels = Variable(labels.cuda(), requires_grad=False)
+
+            scores = model(model_in)
+            loss = criterion(scores, labels)
+            loss.backward()
+            candle.scale_all_lr(model)
+            model_optim.step()
+
+            if n_epoch >= 11110:
+                scores = model(model_in)
+                loss = criterion(scores, labels)
+                loss.backward()
+                mask_optim.step()
+
+            candle.clip_all_masks(model)
+            if i % 16 == 0:
+                n_unpruned = candle.count_params(model, type="unpruned")
+                if n_unpruned > 8328:
+                    candle.prune_all(model, percentage=scheduler.compute_rate())
+                accuracy = (torch.max(scores, 1)[1].view(model_in.size(0)).data == labels.data).sum() / model_in.size(0)
+                print("train accuracy: {:>10}, loss: {:>25}, unpruned: {}".format(accuracy, loss.data[0], n_unpruned))
+        scheduler.step()
+        accuracy = 0
+        n = 0
+        model.eval()
+        for model_in, labels in dev_loader:
+            model_in = Variable(model_in.cuda(), volatile=True)
+            labels = Variable(labels.cuda(), volatile=True)
+            scores = model(model_in)
+            accuracy += (torch.max(scores, 1)[1].view(model_in.size(0)).data == labels.data).sum()
+            n += model_in.size(0)
+        print("dev accuracy: {:>10}".format(accuracy / n))
+        if accuracy > best_dev or True:
+            best_dev = accuracy
+            print("Saving best model...")
+            model.save(args.out_file)
+
+    model.eval()
+    n = 0
+    accuracy = 0
+    for model_in, labels in test_loader:
+        model_in = Variable(model_in.cuda(), volatile=True)
+        labels = Variable(labels.cuda(), volatile=True)
+        scores = model(model_in)
+        accuracy += (torch.max(scores, 1)[1].view(model_in.size(0)).data == labels.data).sum()
+        n += model_in.size(0)
+    print("test accuracy: {:>10}".format(accuracy / n))
+
+def train_binary(args):
     params = candle.list_params(model, train_prune=False)
-    optimizer = torch.optim.Adam(params, lr=3E-4, weight_decay=0.0005)
+    optimizer = torch.optim.Adam(params, lr=5E-3, weight_decay=0.0005)
     criterion = nn.MultiMarginLoss(p=2)
 
     train_set, dev_set, test_set = SingleMnistDataset.splits(args)
     train_loader = data.DataLoader(train_set, batch_size=100, shuffle=True, drop_last=True)
     dev_loader = data.DataLoader(dev_set, batch_size=min(32, len(dev_set)))
     test_loader = data.DataLoader(test_set, batch_size=min(32, len(test_set)))
-    lr_start = 3E-4
+    lr_start = 5E-3
     lr_fin = 1E-5
     if args.n_epochs > 0:
         lr_scheduler = ExponentialLR(optimizer, (lr_fin / lr_start)**(1 / args.n_epochs))
@@ -221,7 +291,6 @@ def train(args):
         accuracy += (torch.max(scores, 1)[1].view(model_in.size(0)).data == labels.data).sum()
         n += model_in.size(0)
     print("test accuracy: {:>10}".format(accuracy / n))
-    model.save(args.out_file)
 
 def init_model(input_file=None, use_cuda=True):
     global model
@@ -239,11 +308,12 @@ def main():
     parser.add_argument("--dir", type=str, default="local_data")
     parser.add_argument("--in_file", type=str, default="")
     parser.add_argument("--out_file", type=str, default="output.pt")
-    parser.add_argument("--n_epochs", type=int, default=40)
+    parser.add_argument("--n_epochs", type=int, default=200)
     args, _ = parser.parse_known_args()
     global model
     init_model(input_file=args.in_file)
-    train(args)
+    # train_binary(args)
+    train_pruned(args)
 
 if __name__ == "__main__":
     main()

@@ -8,6 +8,27 @@ import numpy as np
 from .model import SerializableModule
 from .provider import WeightProvider
 
+class MaskRoundFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, stochastic):
+        if stochastic:
+            return torch.bernoulli(x.clamp(0, 1))
+        return x.clamp(0, 1).round()
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output, None
+
+mask_round = MaskRoundFunction.apply
+
+class MaskRound(SerializableModule):
+    def __init__(self, stochastic=False):
+        super().__init__()
+        self.stochastic = stochastic
+
+    def forward(self, x):
+        return mask_round(x, self.stochastic)
+
 def prune_sort(weights, weight_masks, **kwargs):
     kwargs["use_abs"] = False
     prune_magnitude(weights, weight_masks, **kwargs)
@@ -37,7 +58,7 @@ class CliffFunction(torch.autograd.Function):
     def backward(ctx, grad_output):
         x, alpha = ctx.saved_variables
         grad_output[grad_output > 0] *= alpha
-        return grad_output * x, None
+        return grad_output, None
 
 cliff = CliffFunction.apply
 
@@ -49,14 +70,14 @@ class ReLUCliff(SerializableModule):
     def forward(self, x):
         return cliff(x, self.alpha)
 
-def list_params(model, train_prune=False):
+def list_params(model, train_prune=False, masks_only=False):
     params = []
     for param in model.parameters():
         if not param.requires_grad:
             continue
-        if isinstance(param, WeightMaskParameter) and train_prune:
+        if isinstance(param, WeightMaskParameter) and (train_prune or masks_only):
             params.append(param)
-        elif not isinstance(param, WeightMaskParameter):
+        elif not isinstance(param, WeightMaskParameter) and not masks_only:
             params.append(param)
     return params
 
@@ -72,6 +93,8 @@ def count_unpruned_params(model):
     for m in list_prune_layers(model):
         for w in m.weight_masks():
             n_params += w.sum().data.cpu()[0]
+        # for w in m._weight_masks:
+        #     print(w)
     return n_params
 
 def count_params(model, type="prunable"):
@@ -96,6 +119,8 @@ def normalize_masks(model, soft=False):
 def find_activation(name):
     if name == "cliff":
         return ReLUCliff()
+    elif name == "round":
+        return MaskRound()
     else:
         return None
 
@@ -107,6 +132,17 @@ def clip_all_binary(model):
     for l in list_prune_layers(model):
         if l.binary:
             l.clip_weights(-1, 1)
+
+def mask_decay(model, alpha):
+    loss = 0
+    for l in list_prune_layers(model):
+        for w in l._weight_masks:
+            loss = loss + w.norm(p=2)
+    return alpha * loss
+
+def clip_all_masks(model):
+    for l in list_prune_layers(model):
+        l.clip_weight_masks(0, 1)
 
 def prune_all(model, **kwargs):
     for l in list_prune_layers(model):
@@ -169,12 +205,16 @@ class PruneLayer(SerializableModule):
         self._init_provider()
 
     def _init_masks(self):
-        if not self.config.use_cpu:
-            self._weight_masks = [WeightMaskParameter(torch.ones(*w.size()).cuda(),
-                requires_grad=self.config.prune_trainable) for w in self.weights()]
-        else:
-            self._weight_masks = [WeightMaskParameter(torch.ones(*w.size()),
-                requires_grad=self.config.prune_trainable) for w in self.weights()]
+        def init_mask(size):
+            tensor = torch.Tensor(*size)
+            if self.config.use_cpu:
+                tensor = tensor.cuda()
+            if self.config.prune_trainable:
+                tensor.uniform_(0.5, 0.55)
+            else:
+                tensor.ones_()
+            return tensor
+        self._weight_masks = [WeightMaskParameter(init_mask(w.size())) for w in self.weights()]
         for i, w in enumerate(self._weight_masks):
             self.register_parameter("_mask{}".format(i), w)
         self.activation = find_activation(self.config.prune_activation)
@@ -226,7 +266,7 @@ class PruneLayer(SerializableModule):
     def prune(self, loss=None, **kwargs):
         if not self.prunable:
             return
-        self.prune_call(self.provider(loss), self.weight_masks(), **kwargs)
+        self.prune_call(self.provider(loss), self._weight_masks, **kwargs)
 
     def on_forward(self, *args, **kwargs):
         raise NotImplementedError
@@ -234,6 +274,10 @@ class PruneLayer(SerializableModule):
     def clip_weights(self, a, b):
         for weight in self.weights():
             weight.data.clamp_(a, b)
+
+    def clip_weight_masks(self, a, b):
+        for weight_mask in self._weight_masks:
+            weight_mask.data.clamp_(a, b)
 
     def forward(self, *args, **kwargs):
         out = self.on_forward(*args, **kwargs)
