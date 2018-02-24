@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
+from .functional import *
 from .model import SerializableModule
 
 def huber_transform(x):
@@ -19,52 +20,6 @@ def quantized_loss(params, const):
     for p in params:
         loss = loss + const * (torch.abs(p) - 1).norm(p=1)
     return loss
-
-class BinaryFunction(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x):
-        ctx.save_for_backward(x)
-        return x.sign()
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        (x,) = ctx.saved_variables
-        grad_output[x.abs() > 1] = 0
-        return grad_output
-
-class BinaryTanhFunction(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x):
-        ctx.save_for_backward(x)
-        return 2 * ((x + 1) / 2).clamp(0, 1).round() - 1
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        (x,) = ctx.saved_variables
-        grad_output[x.abs() > 1] = 0
-        return grad_output
-
-class ApproxPow2Function(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x):
-        ctx.save_for_backward(x)
-        return ap2(x)
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        (x,) = ctx.saved_variables
-        return grad_output # TODO: implement proper 2^x grad
-
-class BinaryTanh(SerializableModule):
-    def __init__(self):
-        super().__init__()
-
-    def forward(self, x):
-        return binary_tanh(x)
-
-binarize = BinaryFunction.apply
-binary_tanh = BinaryTanhFunction.apply
-approx_pow2 = ApproxPow2Function.apply
 
 def logb2(x):
     return torch.log(x) / np.log(2)

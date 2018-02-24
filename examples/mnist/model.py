@@ -79,6 +79,8 @@ class SingleMnistDataset(data.Dataset):
         lbl = self.clean_labels[index]
         img = self.clean_images[index]
         arr = np.array(img)
+        if isinstance(model, LeNet5):
+            arr = np.pad(arr, ((2, 2), (2, 2)), "constant")
         if random.random() < 0.5 and self.is_training:
             arr = np.roll(arr, random.randint(-2, 2), 0)
             arr = np.roll(arr, random.randint(-2, 2), 1)
@@ -111,6 +113,48 @@ class DNNModel(SerializableModule):
         for l in self.layers:
             x = l(x)
         return x
+
+class LeNet(SerializableModule):
+    def __init__(self):
+        super().__init__()
+        ctx = candle.Context(candle.read_config())
+        self.net = nn.Sequential(
+            ctx.pruned(nn.Linear(784, 300)),
+            nn.Tanh(),
+            ctx.pruned(nn.Linear(300, 100)),
+            nn.Tanh(),
+            ctx.pruned(nn.Linear(100, 10)))
+
+    def forward(self, x):
+        x = x.view(x.size(0), -1)
+        return self.net(x)
+
+# https://github.com/activatedgeek/LeNet-5/blob/master/lenet.py
+class LeNet5(SerializableModule):
+    def __init__(self):
+        super().__init__()
+        self.use_cuda = True
+        ctx = candle.Context(candle.read_config())
+        self.convnet = nn.Sequential(
+            ctx.pruned(nn.Conv2d(1, 6, 5)),
+            nn.Tanh(),
+            nn.MaxPool2d(2),
+            ctx.pruned(nn.Conv2d(6, 16, 5)),
+            nn.Tanh(),
+            nn.MaxPool2d(2))
+
+        self.fc = nn.Sequential(
+            ctx.pruned(nn.Linear(16 * 25, 120)),
+            nn.Tanh(),
+            ctx.pruned(ctx.pruned(nn.Linear(120, 84))),
+            nn.Tanh(),
+            ctx.pruned(nn.Linear(84, 10)))
+
+    def forward(self, x):
+        x = x.unsqueeze(1)
+        x = self.convnet(x)
+        x = x.view(-1, 16 * 25)
+        return self.fc(x)
 
 class ConvModel(SerializableModule):
     def __init__(self):
@@ -158,26 +202,25 @@ class TinyModel(SerializableModule):
         return self.fc(x.view(x.size(0), -1))
 
 def train_pruned(args):
-    mask_params = candle.list_params(model, masks_only=True)
-    model_params = candle.list_params(model)
-    mask_optim = torch.optim.ASGD(mask_params, lr=0.1)
-    model_optim = torch.optim.SGD(model_params, lr=5E-3, weight_decay=0.0005)
+    model_params = candle.list_params(model, include_masks=True)
+    print("Total parameters: {}".format(sum(x.numel() for x in candle.list_params(model))))
+    print("Unpruned parameters: {}".format(candle.count_params(model, type="unpruned")))
+    model_optim = torch.optim.Adam(model_params, lr=2E-3, weight_decay=0.00002)
     criterion = nn.CrossEntropyLoss()
 
     train_set, dev_set, test_set = SingleMnistDataset.splits(args)
-    train_loader = data.DataLoader(train_set, batch_size=64, shuffle=True, drop_last=True)
+    train_loader = data.DataLoader(train_set, batch_size=256, shuffle=True, drop_last=True)
     dev_loader = data.DataLoader(dev_set, batch_size=min(32, len(dev_set)))
     test_loader = data.DataLoader(test_set, batch_size=min(32, len(test_set)))
 
     best_dev = -0
-    scheduler = candle.ExponentialScheduler(0.92, 1.45, end_idx=16, begin_idx=110)
+    scheduler = candle.ExponentialScheduler(0.95, 1.3, end_idx=16, begin_idx=1110)
 
     for n_epoch in range(args.n_epochs):
         print("Epoch: {}".format(n_epoch + 1))
         model.train()
         for i, (model_in, labels) in enumerate(train_loader):
             model_optim.zero_grad()
-            mask_optim.zero_grad()
 
             model_in = Variable(model_in.cuda(), requires_grad=False)
             labels = Variable(labels.cuda(), requires_grad=False)
@@ -188,16 +231,10 @@ def train_pruned(args):
             candle.scale_all_lr(model)
             model_optim.step()
 
-            if n_epoch >= 11110:
-                scores = model(model_in)
-                loss = criterion(scores, labels)
-                loss.backward()
-                mask_optim.step()
-
             candle.clip_all_masks(model)
             if i % 16 == 0:
                 n_unpruned = candle.count_params(model, type="unpruned")
-                if n_unpruned > 8328:
+                if n_unpruned > 5621:
                     candle.prune_all(model, percentage=scheduler.compute_rate())
                 accuracy = (torch.max(scores, 1)[1].view(model_in.size(0)).data == labels.data).sum() / model_in.size(0)
                 print("train accuracy: {:>10}, loss: {:>25}, unpruned: {}".format(accuracy, loss.data[0], n_unpruned))
@@ -212,7 +249,7 @@ def train_pruned(args):
             accuracy += (torch.max(scores, 1)[1].view(model_in.size(0)).data == labels.data).sum()
             n += model_in.size(0)
         print("dev accuracy: {:>10}".format(accuracy / n))
-        if accuracy > best_dev or True:
+        if accuracy > best_dev:# or True:
             best_dev = accuracy
             print("Saving best model...")
             model.save(args.out_file)
@@ -260,9 +297,6 @@ def train_binary(args):
             optimizer.step()
             candle.clip_all_binary(model)
             if i % 16 == 0:
-                # n_unpruned = candle.count_params(model, type="unpruned")
-                # if n_unpruned...:
-                #     candle.prune_all(model, percentage=scheduler.compute_rate())
                 accuracy = (torch.max(scores, 1)[1].view(model_in.size(0)).data == labels.data).sum() / model_in.size(0)
                 print("train accuracy: {:>10}, loss: {:>25}".format(accuracy, loss.data[0]))
         accuracy = 0
@@ -294,7 +328,7 @@ def train_binary(args):
 
 def init_model(input_file=None, use_cuda=True):
     global model
-    model = ConvModel()
+    model = LeNet()
     model.cuda()
     if input_file:
         model.load(input_file)

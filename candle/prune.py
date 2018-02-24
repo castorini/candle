@@ -1,33 +1,12 @@
-# Adapted various parts from https://github.com/MatthieuCourbariaux/BinaryNet/blob/master/Train-time/binary_net.py
 from torch.autograd import Variable
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
+from .functional import *
 from .model import SerializableModule
 from .provider import WeightProvider
-
-class MaskRoundFunction(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x, stochastic):
-        if stochastic:
-            return torch.bernoulli(x.clamp(0, 1))
-        return x.clamp(0, 1).round()
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        return grad_output, None
-
-mask_round = MaskRoundFunction.apply
-
-class MaskRound(SerializableModule):
-    def __init__(self, stochastic=False):
-        super().__init__()
-        self.stochastic = stochastic
-
-    def forward(self, x):
-        return mask_round(x, self.stochastic)
 
 def prune_sort(weights, weight_masks, **kwargs):
     kwargs["use_abs"] = False
@@ -36,9 +15,9 @@ def prune_sort(weights, weight_masks, **kwargs):
 def prune_magnitude(weights, weight_masks, **kwargs):
     percentage = kwargs.get("percentage", 50)
     min_length = kwargs.get("min_length", 0)
-    do_abs = kwargs.get("use_abs", True)
+    use_abs = kwargs.get("use_abs", True)
     for weight, weight_mask in zip(weights, weight_masks):
-        w = torch.abs(weight) if do_abs else weight
+        w = torch.abs(weight) if use_abs else weight
         _, indices = torch.sort(w.view(-1))
         ne0_indices = indices[weight_mask.view(-1)[indices] != 0]
         if ne0_indices.size(0) < min_length:
@@ -48,34 +27,12 @@ def prune_magnitude(weights, weight_masks, **kwargs):
         if indices.size(0) > 0:
             weight_mask.data.view(-1)[indices.data] = 0
 
-class CliffFunction(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x, alpha):
-        ctx.save_for_backward(x, alpha)
-        return x
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        x, alpha = ctx.saved_variables
-        grad_output[grad_output > 0] *= alpha
-        return grad_output, None
-
-cliff = CliffFunction.apply
-
-class ReLUCliff(SerializableModule):
-    def __init__(self, alpha=1):
-        super().__init__()
-        self.alpha = Variable(torch.Tensor([alpha]).cuda(), requires_grad=False)
-
-    def forward(self, x):
-        return cliff(x, self.alpha)
-
-def list_params(model, train_prune=False, masks_only=False):
+def list_params(model, include_masks=False, masks_only=False):
     params = []
     for param in model.parameters():
         if not param.requires_grad:
             continue
-        if isinstance(param, WeightMaskParameter) and (train_prune or masks_only):
+        if isinstance(param, WeightMaskParameter) and (include_masks or masks_only):
             params.append(param)
         elif not isinstance(param, WeightMaskParameter) and not masks_only:
             params.append(param)
@@ -93,8 +50,6 @@ def count_unpruned_params(model):
     for m in list_prune_layers(model):
         for w in m.weight_masks():
             n_params += w.sum().data.cpu()[0]
-        # for w in m._weight_masks:
-        #     print(w)
     return n_params
 
 def count_params(model, type="prunable"):
@@ -117,10 +72,10 @@ def normalize_masks(model, soft=False):
                 w.data.clamp_(0, 1).round_()
 
 def find_activation(name):
-    if name == "cliff":
-        return ReLUCliff()
-    elif name == "round":
-        return MaskRound()
+    if name == "hard_round":
+        return HardRound()
+    elif name == "smooth_round":
+        return SmoothRound()
     else:
         return None
 
@@ -150,7 +105,7 @@ def prune_all(model, **kwargs):
 
 def apply_all_hooks(model):
     for l in list_prune_layers(model):
-        l.apply_hook()
+        l.apply_weight_hook()
 
 def update_all(model, **kwargs):
     for l in list_prune_layers(model):
@@ -162,7 +117,7 @@ def remove_activations(model):
 
 def restore_activations(model):
     for l in list_prune_layers(model):
-        l.activation = find_activation(l.config.prune_activation)
+        l.activation = find_activation(l.prune_activation)
 
 class WeightMaskParameter(nn.Parameter):
     def __init__(self, *args, **kwargs):
@@ -189,14 +144,17 @@ def compute_fans(tensor):
     return fan_in, fan_out
 
 class PruneLayer(SerializableModule):
-    def __init__(self, config, provider=None, prunable=True):
+    def __init__(self, provider=None, prunable=True, binary=False, **kwargs):
         super().__init__()
-        self.prune_call = _methods[config.prune_method]
-        self.config = config
+        prune_method = kwargs.get("prune_method", "magnitude")
+        self.prune_call = _prune_methods[prune_method]
+        self.prune_trainable = kwargs.get("prune_trainable", False)
+        self.prune_activation = kwargs.get("prune_activation", None)
+        
         self.provider = provider
         self.hook = None
         self.mutable_forward_hook = None
-        self.binary = False
+        self.binary = binary
         self.prunable = prunable
         self._w_scales = None
 
@@ -205,19 +163,20 @@ class PruneLayer(SerializableModule):
         self._init_provider()
 
     def _init_masks(self):
-        def init_mask(size):
-            tensor = torch.Tensor(*size)
-            if self.config.use_cpu:
-                tensor = tensor.cuda()
-            if self.config.prune_trainable:
+        def init_mask(weight):
+            tensor = torch.Tensor(*weight.size())
+            if self.prune_trainable:
                 tensor.uniform_(0.5, 0.55)
             else:
-                tensor.ones_()
+                tensor.copy_(torch.ones(*weight.size()))
+            if weight.is_cuda:
+                tensor = tensor.cuda()
             return tensor
-        self._weight_masks = [WeightMaskParameter(init_mask(w.size())) for w in self.weights()]
+
+        self._weight_masks = [WeightMaskParameter(init_mask(w)) for w in self.weights()]
         for i, w in enumerate(self._weight_masks):
             self.register_parameter("_mask{}".format(i), w)
-        self.activation = find_activation(self.config.prune_activation)
+        self.activation = find_activation(self.prune_activation)
 
     def apply_grad_lr(self):
         if not self._w_scales:
@@ -251,7 +210,7 @@ class PruneLayer(SerializableModule):
             return weight
         return self.hook(weight)
 
-    def apply_hook(self):
+    def apply_weight_hook(self):
         for w in self.weights():
             w.data = self.hook_weight(w).data
 
@@ -320,8 +279,8 @@ class PruneRNNBase(nn.modules.rnn.RNNBase):
         return list(self.parameters())
 
 class PruneRNN(PruneLayer):
-    def __init__(self, child, config, **kwargs):
-        super().__init__(config, **kwargs)
+    def __init__(self, child, **kwargs):
+        super().__init__(**kwargs)
         self.child = child
         self._init()
 
@@ -335,18 +294,12 @@ class PruneRNN(PruneLayer):
         return val
 
 class _PruneConvNd(PruneLayer):
-    def __init__(self, conv_args, config, conv_cls, conv_fn, provider=None, prunable=False, **kwargs):
-        super().__init__(config, provider)
-        in_channels, out_channels, kernel_size = conv_args
-        self.conv_kwargs = kwargs
-        dummy_conv = conv_cls(in_channels, out_channels, kernel_size, **kwargs)
-        if not config.use_cpu:
-            dummy_conv = dummy_conv.cuda()
-        self.weight = dummy_conv.weight
-        self.bias = dummy_conv.bias
-        self.kernel_size = dummy_conv.kernel_size
-        self.out_channels = out_channels
-        self.in_channels = in_channels
+    def __init__(self, child, conv_fn, **kwargs):
+        super().__init__(**kwargs)
+        self.in_channels, self.out_channels = child.in_channels, child.out_channels
+        self.kernel_size = child.kernel_size
+        self.weight = child.weight
+        self.bias = child.bias
         if not kwargs.get("bias", True):
             kwargs["bias"] = None
         if "bias" in kwargs and kwargs["bias"]:
@@ -369,26 +322,23 @@ class _PruneConvNd(PruneLayer):
             return self.conv_fn(x, weight, **self.conv_kwargs)
 
 class PruneConv3d(_PruneConvNd):
-    def __init__(self, conv_args, config, provider=None, **kwargs):
-        super().__init__(conv_args, config, nn.Conv3d, F.conv3d, provider=provider, **kwargs)
+    def __init__(self, child, **kwargs):
+        super().__init__(child, F.conv3d, **kwargs)
 
 class PruneConv2d(_PruneConvNd):
-    def __init__(self, conv_args, config, provider=None, **kwargs):
-        super().__init__(conv_args, config, nn.Conv2d, F.conv2d, provider=provider, **kwargs)
+    def __init__(self, child, **kwargs):
+        super().__init__(child, F.conv2d, **kwargs)
 
 class PruneConv1d(_PruneConvNd):
-    def __init__(self, conv_args, config, provider=None, **kwargs):
-        super().__init__(conv_args, config, nn.Conv1d, F.conv1d, provider=provider, **kwargs)
+    def __init__(self, child, **kwargs):
+        super().__init__(child, F.conv1d, **kwargs)
 
 class PruneLinear(PruneLayer):
-    def __init__(self, lin_args, config, **kwargs):
-        super().__init__(config, **kwargs)
-        in_features, out_features = lin_args
-        dummy_linear = nn.Linear(in_features, out_features)
-        if not config.use_cpu:
-            dummy_linear = dummy_linear.cuda()
-        self.weight = dummy_linear.weight
-        self.bias = dummy_linear.bias
+    def __init__(self, child, **kwargs):
+        super().__init__(**kwargs)
+        in_features, out_features = child.in_features, child.out_features
+        self.weight = child.weight
+        self.bias = child.bias
         self._init()
 
     def weights(self):
@@ -399,4 +349,4 @@ class PruneLinear(PruneLayer):
         bias = self.hook_weight(self.bias) * self.weight_masks()[1]
         return F.linear(x, weight, bias)
 
-_methods = dict(magnitude=prune_magnitude, sort=prune_sort)
+_prune_methods = dict(magnitude=prune_magnitude, sort=prune_sort)

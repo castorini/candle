@@ -1,8 +1,6 @@
 import torch
 import torch.autograd as ag
 
-from .model import hessian_vector_product as hvp
-
 class WeightProvider(object):
     def __init__(self, layer, average=False):
         self.weights = layer.weights()

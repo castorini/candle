@@ -16,8 +16,9 @@ class SerializableModule(nn.Module):
 
 class Context(object):
     def __init__(self, prune_cfg, **kwargs):
-        self.config = prune_cfg
-        self.kwargs = kwargs
+        self.kwargs = dict(prune_method=prune_cfg.prune_method, prune_trainable=prune_cfg.prune_trainable,
+            prune_activation=prune_cfg.prune_activation)
+        self.kwargs.update(kwargs)
 
     def _make_prune_module(self, module, **kwargs):
         kwargs["prunable"] = kwargs.get("prunable", False)
@@ -25,22 +26,24 @@ class Context(object):
             return module
         if isinstance(module, nn.modules.conv._ConvNd):
             in_c, out_c, k_size = module.in_channels, module.out_channels, module.kernel_size
+            stride, padding = module.stride, module.padding
+            kwargs["stride"] = stride
+            kwargs["padding"] = padding
             if isinstance(module, nn.Conv2d):
-                return candle.PruneConv2d((in_c, out_c, k_size), self.config, **kwargs)
+                return candle.PruneConv2d(module, **kwargs)
             elif isinstance(module, nn.Conv1d):
-                return candle.PruneConv1d((in_c, out_c, k_size), self.config, **kwargs)
+                return candle.PruneConv1d(module, **kwargs)
             elif isinstance(module, nn.Conv3d):
-                return candle.PruneConv3d((in_c, out_c, k_size), self.config, **kwargs)
+                return candle.PruneConv3d(module, **kwargs)
         elif isinstance(module, nn.Linear):
-            in_feats, out_feats = module.in_features, module.out_features
-            return candle.PruneLinear((in_feats, out_feats), self.config, **kwargs)
+            return candle.PruneLinear(module, **kwargs)
         elif isinstance(module, nn.modules.rnn.RNNBase):
             mode, input_size, hidden_size = module.mode, module.input_size, module.hidden_size
             num_layers, bias, batch_first = module.num_layers, module.bias, module.batch_first
             bidirectional, dropout = module.bidirectional, module.dropout
             base = candle.PruneRNNBase(mode, input_size, hidden_size, num_layers=num_layers, 
                 bias=bias, batch_first=batch_first, bidirectional=bidirectional, dropout=dropout)
-            return candle.PruneRNN(base, self.config, **kwargs)
+            return candle.PruneRNN(base, **kwargs)
 
     def pruned(self, module, **kwargs):
         kwargs["prunable"] = True
@@ -57,10 +60,3 @@ class Context(object):
         for weight in module.weights():
             weight.data.uniform_(-1, 1)
         return module
-
-# Adapted from https://github.com/tensorflow/tensorflow/blob/master/tensorflow/python/ops/gradients_impl.py#L924
-def hessian_vector_product(y, x, v):
-    v = v.detach()
-    grads = ag.grad(y, x, create_graph=True)[0]
-    elem_prods = torch.sum(v * grads)
-    return ag.grad(elem_prods, x, create_graph=True)[0], grads

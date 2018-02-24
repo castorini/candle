@@ -77,8 +77,6 @@ def train(args):
             loss.backward()
             optimizer.step()
             if i % 8 == 0:
-                # if n_epoch < args.n_epochs - 4:
-                #     candle.prune_all(model, percentage=1.5 * 0.6**n_epoch)
                 n_unpruned = candle.count_params(model, type="unpruned")
                 accuracy = (torch.max(scores, 1)[1].view(model_in.size(0)).data == labels.data).sum() / model_in.size(0)
                 print("{} train accuracy: {:>10}, loss: {:>25}, unpruned: {:>10}".format((n_epoch * len(train_set)) // 128 + i, 

@@ -4,7 +4,7 @@ class Configs(object):
     @staticmethod
     def base_config():
         parser = argparse.ArgumentParser()
-        parser.add_argument("--prune_activation", type=str, default=None, choices=[None, "cliff", "round"])
+        parser.add_argument("--prune_activation", type=str, default=None, choices=[None, "hard_round", "smooth_round"])
         parser.add_argument("--prune_method", type=str, default="magnitude", choices=["magnitude", "sort"])
         parser.add_argument("--use_cpu", action="store_true", default=False)
         parser.add_argument("--prune_trainable", action="store_true", default=False)
