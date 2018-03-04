@@ -95,17 +95,16 @@ class DNNModel(SerializableModule):
     def __init__(self):
         super().__init__()
         self.use_cuda = True
-        def make_hidden(n_in, n_out, dropout=0.5):
+        def make_hidden(n_in, n_out):
             return nn.Sequential(
-                ctx.binarized(nn.Linear(n_in, n_out)),
+                ctx.pruned(nn.Linear(n_in, n_out)),
                 nn.BatchNorm1d(n_out),
-                candle.BinaryTanh(),
-                nn.Dropout(dropout))
-        ctx = candle.Context(candle.read_config())
-        n_units = 4096
-        mod_list = [make_hidden(784, n_units, dropout=0.2)]
+                nn.Tanh())
+        ctx = candle.Context(candle.read_config(), mask_decay=5E-3)
+        n_units = 2048
+        mod_list = [make_hidden(784, n_units)]
         mod_list.extend(make_hidden(n_units, n_units) for _ in range(3))
-        mod_list.append(ctx.binarized(nn.Linear(n_units, 10)))
+        mod_list.append(ctx.pruned(nn.Linear(n_units, 10)))
         self.layers = nn.ModuleList(mod_list)
 
     def forward(self, x):
@@ -134,21 +133,21 @@ class LeNet5(SerializableModule):
     def __init__(self):
         super().__init__()
         self.use_cuda = True
-        ctx = candle.Context(candle.read_config())
+        ctx = candle.Context(candle.read_config(), mask_lr=1E-3)
         self.convnet = nn.Sequential(
-            ctx.pruned(nn.Conv2d(1, 6, 5)),
+            ctx.pruned(nn.Conv2d(1, 6, 5), mask_decay=5E-3),
             nn.Tanh(),
             nn.MaxPool2d(2),
-            ctx.pruned(nn.Conv2d(6, 16, 5)),
+            ctx.pruned(nn.Conv2d(6, 16, 5), mask_decay=5E-4),
             nn.Tanh(),
             nn.MaxPool2d(2))
 
         self.fc = nn.Sequential(
-            ctx.pruned(nn.Linear(16 * 25, 120)),
+            ctx.pruned(nn.Linear(16 * 25, 120), mask_decay=1E-4),
             nn.Tanh(),
-            ctx.pruned(ctx.pruned(nn.Linear(120, 84))),
+            ctx.pruned(nn.Linear(120, 84), mask_decay=1E-4),
             nn.Tanh(),
-            ctx.pruned(nn.Linear(84, 10)))
+            ctx.pruned(nn.Linear(84, 10), mask_decay=1E-5))
 
     def forward(self, x):
         x = x.unsqueeze(1)
@@ -160,15 +159,15 @@ class ConvModel(SerializableModule):
     def __init__(self):
         super().__init__()
         self.use_cuda = True
-        ctx = candle.Context(candle.read_config())
-        self.conv1 = ctx.pruned(nn.Conv2d(1, 64, 5))
+        self.ctx = ctx = candle.PruneContext()
+        self.conv1 = ctx.wrap(nn.Conv2d(1, 64, 5))
         self.bn1 = nn.BatchNorm2d(64, affine=True)
-        self.conv2 = ctx.pruned(nn.Conv2d(64, 96, 5))
+        self.conv2 = ctx.wrap(nn.Conv2d(64, 96, 5))
         self.bn2 = nn.BatchNorm2d(96, affine=True)
         self.pool = nn.MaxPool2d(2)
         self.dropout = nn.Dropout(0.6)
-        self.fc1 = ctx.pruned(nn.Linear(16 * 96, 1024))
-        self.fc2 = nn.Linear(1024, 10)
+        self.fc1 = ctx.wrap(nn.Linear(16 * 96, 1024))
+        self.fc2 = ctx.wrap(nn.Linear(1024, 10))
 
     def encode(self, x):
         x = x.unsqueeze(1)
@@ -202,19 +201,23 @@ class TinyModel(SerializableModule):
         return self.fc(x.view(x.size(0), -1))
 
 def train_pruned(args):
-    model_params = candle.list_params(model, include_masks=True)
-    print("Total parameters: {}".format(sum(x.numel() for x in candle.list_params(model))))
-    print("Unpruned parameters: {}".format(candle.count_params(model, type="unpruned")))
-    model_optim = torch.optim.Adam(model_params, lr=2E-3, weight_decay=0.00002)
+    model = ConvModel()
+    if args.in_file:
+        model.load(args.in_file)
+    model = model.cuda()
+    ctx = model.ctx
+    model_params = ctx.list_mask_params(inverse=True)
+    print("Unpruned parameters: {}".format(ctx.count_unpruned()))
+    model_optim = torch.optim.Adam(model_params, lr=5E-4, weight_decay=5E-5)
     criterion = nn.CrossEntropyLoss()
 
     train_set, dev_set, test_set = SingleMnistDataset.splits(args)
-    train_loader = data.DataLoader(train_set, batch_size=256, shuffle=True, drop_last=True)
+    train_loader = data.DataLoader(train_set, batch_size=64, shuffle=True, drop_last=True)
     dev_loader = data.DataLoader(dev_set, batch_size=min(32, len(dev_set)))
     test_loader = data.DataLoader(test_set, batch_size=min(32, len(test_set)))
 
     best_dev = -0
-    scheduler = candle.ExponentialScheduler(0.95, 1.3, end_idx=16, begin_idx=1110)
+    best_state = None
 
     for n_epoch in range(args.n_epochs):
         print("Epoch: {}".format(n_epoch + 1))
@@ -228,17 +231,14 @@ def train_pruned(args):
             scores = model(model_in)
             loss = criterion(scores, labels)
             loss.backward()
-            candle.scale_all_lr(model)
             model_optim.step()
 
-            candle.clip_all_masks(model)
-            if i % 16 == 0:
-                n_unpruned = candle.count_params(model, type="unpruned")
-                if n_unpruned > 5621:
-                    candle.prune_all(model, percentage=scheduler.compute_rate())
+            ctx.clip_all_masks()
+            if i % 200 == 0:
+                n_unpruned = ctx.count_unpruned()
+                ctx.prune(10)
                 accuracy = (torch.max(scores, 1)[1].view(model_in.size(0)).data == labels.data).sum() / model_in.size(0)
                 print("train accuracy: {:>10}, loss: {:>25}, unpruned: {}".format(accuracy, loss.data[0], n_unpruned))
-        scheduler.step()
         accuracy = 0
         n = 0
         model.eval()
@@ -249,71 +249,8 @@ def train_pruned(args):
             accuracy += (torch.max(scores, 1)[1].view(model_in.size(0)).data == labels.data).sum()
             n += model_in.size(0)
         print("dev accuracy: {:>10}".format(accuracy / n))
-        if accuracy > best_dev:# or True:
-            best_dev = accuracy
-            print("Saving best model...")
-            model.save(args.out_file)
-
-    model.eval()
-    n = 0
-    accuracy = 0
-    for model_in, labels in test_loader:
-        model_in = Variable(model_in.cuda(), volatile=True)
-        labels = Variable(labels.cuda(), volatile=True)
-        scores = model(model_in)
-        accuracy += (torch.max(scores, 1)[1].view(model_in.size(0)).data == labels.data).sum()
-        n += model_in.size(0)
-    print("test accuracy: {:>10}".format(accuracy / n))
-
-def train_binary(args):
-    params = candle.list_params(model, train_prune=False)
-    optimizer = torch.optim.Adam(params, lr=5E-3, weight_decay=0.0005)
-    criterion = nn.MultiMarginLoss(p=2)
-
-    train_set, dev_set, test_set = SingleMnistDataset.splits(args)
-    train_loader = data.DataLoader(train_set, batch_size=100, shuffle=True, drop_last=True)
-    dev_loader = data.DataLoader(dev_set, batch_size=min(32, len(dev_set)))
-    test_loader = data.DataLoader(test_set, batch_size=min(32, len(test_set)))
-    lr_start = 5E-3
-    lr_fin = 1E-5
-    if args.n_epochs > 0:
-        lr_scheduler = ExponentialLR(optimizer, (lr_fin / lr_start)**(1 / args.n_epochs))
-
-    best_dev = -np.inf
-
-    for n_epoch in range(args.n_epochs):
-        print("Epoch: {}".format(n_epoch + 1))
-        for i, (model_in, labels) in enumerate(train_loader):
-            model.train()
-            optimizer.zero_grad()
-
-            model_in = Variable(model_in.cuda(), requires_grad=False)
-            labels = Variable(labels.cuda(), requires_grad=False)
-            scores = model(model_in)
-            loss = criterion(scores, labels)
-            loss.backward()
-            candle.update_all(model)
-            candle.scale_all_lr(model)
-            optimizer.step()
-            candle.clip_all_binary(model)
-            if i % 16 == 0:
-                accuracy = (torch.max(scores, 1)[1].view(model_in.size(0)).data == labels.data).sum() / model_in.size(0)
-                print("train accuracy: {:>10}, loss: {:>25}".format(accuracy, loss.data[0]))
-        accuracy = 0
-        n = 0
-        model.eval()
-        for model_in, labels in dev_loader:
-            model_in = Variable(model_in.cuda(), volatile=True)
-            labels = Variable(labels.cuda(), volatile=True)
-            scores = model(model_in)
-            accuracy += (torch.max(scores, 1)[1].view(model_in.size(0)).data == labels.data).sum()
-            n += model_in.size(0)
-        print("dev accuracy: {:>10}".format(accuracy / n))
-        lr_scheduler.step()
-        if accuracy > best_dev:
-            best_dev = accuracy
-            print("Saving best model...")
-            model.save(args.out_file)
+        # if trainer.save(-accuracy):
+        #     print("Saving...")
 
     model.eval()
     n = 0
@@ -327,14 +264,12 @@ def train_binary(args):
     print("test accuracy: {:>10}".format(accuracy / n))
 
 def init_model(input_file=None, use_cuda=True):
-    global model
-    model = LeNet()
     model.cuda()
     if input_file:
         model.load(input_file)
     model.eval()
 
-model = None
+model = ConvModel()
 
 def main():
     parser = argparse.ArgumentParser()
