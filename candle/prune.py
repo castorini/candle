@@ -5,7 +5,8 @@ import torch.nn.functional as F
 import numpy as np
 
 from .context import Context
-from .proxy import Proxy, ProxyDecorator, nested_map, flatten, flatten_zip
+from .nested_list import *
+from .proxy import Proxy, ProxyDecorator
 
 class WeightMask(ProxyDecorator):
     def __init__(self, child, init_value=1):

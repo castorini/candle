@@ -4,21 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
-def flatten_zip(*args):
-    args = [flatten(arg) for arg in args]
-    return zip(*args)
-
-def nested_map(fn, nested_list):
-    return [nested_map(fn, e) if isinstance(e, list) else fn(e) for e in nested_list]
-
-def flatten(nested_list):
-    items = []
-    for elem in nested_list:
-        if isinstance(elem, list):
-            items.extend(flatten(elem))
-        else:
-            items.append(elem)
-    return items
+from .nested_list import *
 
 class Proxy(object):
     def __init__(self):
