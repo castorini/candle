@@ -1,6 +1,10 @@
 # Candle: 
 PyTorch utilities for pruning and quantization.
 
+## How to Install PyTorch on RPi
+1. Increase swap space to 1-2 GB
+2. Install PyTorch as usual
+
 ## Notes:
 - When designing architectures, it's helpful to interleave batch normalization with quantized layers. This reduces covariate shift, which can be quite extreme for binary weights.
 - It also helps to "prime" weights by pre-training with full-precision using a soft quantize penalty (see `quantized_loss`). This loss should increase according to a schedule. Sometimes, this will make the difference between convergence and divergence.
