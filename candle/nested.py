@@ -1,8 +1,59 @@
 class Package(object):
-    def __init__(self, *children, children_type=None):
+    """
+    Convenience data structure for performing operations on nested list groups. For example,
+    a = Package(["a", "b", ["d", "e"]])
+    (a + " ").reify() ==> ["a ", "b ", ["d ", "e "]]
+    """
+
+    def __init__(self, children, children_type=None):
         assert len(children) != 0 or children_type
-        self.children = children
-        self.children_type = children_type if children_type else type(children[0])
+        self.children = self._build_children(children)
+        self.children_type = children_type if children_type else self._discover_type()
+
+    def _build_children(self, children):
+        children_list = []
+        for child in children:
+            children_list.append(Package(child) if isinstance(child, list) else child)
+        return children_list
+
+    def _discover_type(self):
+        for child in self.children:
+            if isinstance(child, Package):
+                return child._discover_type()
+            return type(child)
+
+    def reify(self, flat=False):
+        reified = [item.reify() if isinstance(item, Package) else item for item in self.children]
+        if flat:
+            reified = flatten(reified)
+        return reified
+
+    def __getattribute__(self, name):
+        def wrap_attr(attr_name, element_list):
+            def get_attr(*args, **kwargs):
+                use_pkg_iter = False
+                for arg in args:
+                    if isinstance(arg, Package):
+                        args = arg.children
+                        use_pkg_iter = True
+                        break
+
+                new_elems = []
+                for i, element in enumerate(element_list):
+                    new_args = (args[i],) if use_pkg_iter else args
+                    if isinstance(element, Package):
+                        new_elem = wrap_attr(attr_name, element.children)(*new_args, **kwargs)
+                    else:
+                        attr = getattr(element, attr_name)
+                        new_elem = attr(*new_args, **kwargs) if callable(attr) else attr
+                    new_elems.append(new_elem)
+                return Package(new_elems)
+            return get_attr if callable(getattr(self.children_type, name)) else get_attr()
+
+        if name in ("children", "children_type", "__getattribute__", "_discover_type", 
+                "_build_children", "reify"):
+            return object.__getattribute__(self, name)
+        return wrap_attr(name, self.children)
 
     def __add__(self, other): return self.__getattribute__("__add__")(other)
     def __sub__(self, other): return self.__getattribute__("__sub__")(other)
@@ -36,24 +87,7 @@ class Package(object):
     def __int__(self): return self.__getattribute__("__int__")()
     def __long__(self): return self.__getattribute__("__long__")()
     def __float__(self): return self.__getattribute__("__float__")()
-
-    def __getattribute__(self, name):
-        def wrap_attr(attr_name, element_list):
-            def get_attr(*args, **kwargs):
-                new_elems = []
-                for element in element_list:
-                    if isinstance(element, list):
-                        new_elem = wrap_attr(attr_name, element)(*args, **kwargs)
-                    else:
-                        attr = getattr(element, attr_name)
-                        new_elem = attr(*args, **kwargs) if callable(attr) else attr
-                    new_elems.append(new_elem)
-                return Package(*new_elems)
-            return get_attr if callable(getattr(self.children_type, name)) else get_attr()
-
-        if name in ("children", "children_type", "__getattribute__"):
-            return object.__getattribute__(self, name)
-        return wrap_attr(name, self.children)
+    def __getitem__(self, key): return self.__getattribute__("__getitem__")(key)
 
 def flatten_zip(*args):
     args = [flatten(arg) for arg in args]
