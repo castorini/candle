@@ -28,8 +28,15 @@ class Package(object):
             reified = flatten(reified)
         return reified
 
+    def _apply_function(self, function, elements):
+        return Package([self._apply_function(function, e.children) if isinstance(e, Package) else
+            function(e) for e in elements])
+
+    def apply_function(self, function):
+        return self._apply_function(function, self.children)
+
     def __getattribute__(self, name):
-        def wrap_attr(attr_name, element_list):
+        def wrap_attr(attr_name, elements):
             def get_attr(*args, **kwargs):
                 use_pkg_iter = False
                 for arg in args:
@@ -39,7 +46,7 @@ class Package(object):
                         break
 
                 new_elems = []
-                for i, element in enumerate(element_list):
+                for i, element in enumerate(elements):
                     new_args = (args[i],) if use_pkg_iter else args
                     if isinstance(element, Package):
                         new_elem = wrap_attr(attr_name, element.children)(*new_args, **kwargs)
@@ -51,7 +58,7 @@ class Package(object):
             return get_attr if callable(getattr(self.children_type, name)) else get_attr()
 
         if name in ("children", "children_type", "__getattribute__", "_discover_type", 
-                "_build_children", "reify"):
+                "_build_children", "reify", "apply_function", "_apply_function"):
             return object.__getattribute__(self, name)
         return wrap_attr(name, self.children)
 
@@ -88,6 +95,7 @@ class Package(object):
     def __long__(self): return self.__getattribute__("__long__")()
     def __float__(self): return self.__getattribute__("__float__")()
     def __getitem__(self, key): return self.__getattribute__("__getitem__")(key)
+    def __setitem__(self, key, value): return self.__getattribute__("__setitem__")(key, value)
 
 def flatten_zip(*args):
     args = [flatten(arg) for arg in args]

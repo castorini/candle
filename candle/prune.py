@@ -5,14 +5,14 @@ import torch.nn.functional as F
 import numpy as np
 
 from .context import Context
-from .nested_list import *
+from .nested import *
 from .proxy import Proxy, ProxyDecorator
 
 class WeightMask(ProxyDecorator):
     def __init__(self, child, init_value=1):
         super().__init__(child)
-        self.masks = nested_map(lambda size: nn.Parameter(torch.ones(*size) * init_value), child.sizes)
-        self._flattened_masks = flatten(self.masks)
+        self.masks = Package(nested_map(lambda size: nn.Parameter(torch.ones(*size) * init_value), child.sizes))
+        self._flattened_masks = self.masks.reify(flat=True)
 
     def parameters(self):
         return self._flattened_masks
@@ -21,28 +21,19 @@ class WeightMask(ProxyDecorator):
     def sizes(self):
         return self.child.sizes
 
-    def apply(self, weights, masks):
-        applied_masks = []
-        for w, m in zip(weights, masks):
-            if isinstance(w, list):
-                applied_masks.append(self.apply(w, m))
-            else:
-                applied_masks.append(w * m)
-        return applied_masks
-
-    def call(self, *weights):
-        return self.apply(weights, self.masks)
+    def call(self, input):
+        return input * self.masks
 
 class StochasticWeightMask(WeightMask):
     def __init__(self, child, init_prob=1):
         super().__init__(child, init_value=init_prob)
 
-    def call(self, *weights):
-        return self.apply(weights, nested_map(lambda m: torch.bernoulli(torch.clamp(m, 0, 1)), self.masks))
+    def call(self, input):
+        return input * self.masks.clamp(0, 1).bernoulli()
 
 def _rank_magnitude(context, proxies):
     providers = context.list_providers()
-    ranks = [nested_map(lambda p: torch.abs(p), provider.raw_parameters) for provider in providers]
+    ranks = [provider.package.abs() for provider in providers]
     return ranks
 
 class PruneContext(Context):
@@ -73,7 +64,7 @@ class PruneContext(Context):
         proxies = self.list_proxies("weight_hook", WeightMask)
         weights_list = rank_call(self, proxies)
         for weights, proxy in zip(weights_list, proxies):
-            for weight, mask in flatten_zip(weights, proxy.masks):
+            for weight, mask in flatten_zip(weights.reify(), proxy.masks.reify()):
                 _, indices = torch.sort(weight.view(-1))
                 ne0_indices = indices[mask.view(-1)[indices] != 0]
                 if ne0_indices.size(0) == 0:

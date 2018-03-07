@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
-from .nested_list import *
+from .nested import Package
 
 class Proxy(object):
     def __init__(self):
@@ -25,29 +25,29 @@ class ProxyDecorator(Proxy):
         super().__init__()
         self.child = child
 
-    def call(self, *args, **kwargs):
+    def call(self, package, **kwargs):
         raise NotImplementedError
 
     def __call__(self, *args, **kwargs):
         if self.child is not None:
-            args = self.child(*args, **kwargs)
-        return self.call(*args, **kwargs)
+            package = self.child(*args, **kwargs)
+        return self.call(package, **kwargs)
 
 class IdentityProxy(Proxy):
     def __init__(self, parameters):
         super().__init__()
-        self.raw_parameters = list(parameters)
-        self._flattened_params = flatten(self.raw_parameters)
+        self.package = Package(list(parameters))
+        self._flattened_params = self.package.reify(flat=True)
 
     def parameters(self):
         return self._flattened_params
 
     @property
     def sizes(self):
-        return nested_map(lambda p: p.size(), self.raw_parameters)
+        return self.package.size().reify()
 
     def __call__(self):
-        return self.raw_parameters
+        return self.package
 
 class ProxyLayer(nn.Module):
     def __init__(self, weight_provider, registry=None):
@@ -124,7 +124,7 @@ class _ProxyConvNd(ProxyLayer):
             self._conv_kwargs["bias"] = None
 
     def on_forward(self, x):
-        weights = self.weight_provider()
+        weights = self.weight_provider().reify()
         return self.conv_fn(x, *weights, **self._conv_kwargs)
 
 class ProxyConv3d(_ProxyConvNd):
@@ -144,7 +144,7 @@ class ProxyLinear(ProxyLayer):
         super().__init__(weight_provider, **kwargs)
 
     def on_forward(self, x):
-        weights = self.weight_provider()
+        weights = self.weight_provider().reify()
         return F.linear(x, *weights)
 
 class ProxyRNNBase(nn.modules.rnn.RNNBase):
@@ -177,7 +177,7 @@ class ProxyRNN(ProxyLayer):
         return
 
     def on_forward(self, x, *args, **kwargs):
-        self.child._inject(self.weight_provider())
+        self.child._inject(self.weight_provider().reify())
         val = self.child(x, *args, **kwargs)
         self.child._uninject()
         return val
