@@ -116,13 +116,13 @@ class DNNModel(SerializableModule):
 class LeNet(SerializableModule):
     def __init__(self):
         super().__init__()
-        ctx = candle.Context(candle.read_config())
+        self.g_ctx = ctx = candle.GroupPruneContext()
         self.net = nn.Sequential(
-            ctx.pruned(nn.Linear(784, 300)),
+            ctx.wrap(nn.Linear(784, 300), prune="in"),
             nn.Tanh(),
-            ctx.pruned(nn.Linear(300, 100)),
+            ctx.wrap(nn.Linear(300, 100), prune="in"),
             nn.Tanh(),
-            ctx.pruned(nn.Linear(100, 10)))
+            ctx.wrap(nn.Linear(100, 10), prune="in"))
 
     def forward(self, x):
         x = x.view(x.size(0), -1)
@@ -132,22 +132,21 @@ class LeNet(SerializableModule):
 class LeNet5(SerializableModule):
     def __init__(self):
         super().__init__()
-        self.use_cuda = True
-        ctx = candle.Context(candle.read_config(), mask_lr=1E-3)
+        self.g_ctx = ctx = candle.GroupPruneContext()
         self.convnet = nn.Sequential(
-            ctx.pruned(nn.Conv2d(1, 6, 5), mask_decay=5E-3),
+            ctx.wrap(nn.Conv2d(1, 6, 5)),
             nn.Tanh(),
             nn.MaxPool2d(2),
-            ctx.pruned(nn.Conv2d(6, 16, 5), mask_decay=5E-4),
+            ctx.wrap(nn.Conv2d(6, 16, 5)),
             nn.Tanh(),
             nn.MaxPool2d(2))
 
         self.fc = nn.Sequential(
-            ctx.pruned(nn.Linear(16 * 25, 120), mask_decay=1E-4),
+            ctx.bypass(nn.Linear(16 * 25, 120)),
             nn.Tanh(),
-            ctx.pruned(nn.Linear(120, 84), mask_decay=1E-4),
+            ctx.bypass(nn.Linear(120, 84)),
             nn.Tanh(),
-            ctx.pruned(nn.Linear(84, 10), mask_decay=1E-5))
+            ctx.bypass(nn.Linear(84, 10)))
 
     def forward(self, x):
         x = x.unsqueeze(1)
@@ -159,15 +158,15 @@ class ConvModel(SerializableModule):
     def __init__(self):
         super().__init__()
         self.use_cuda = True
-        self.ctx = ctx = candle.PruneContext()
+        self.g_ctx = ctx = candle.GroupPruneContext()
         self.conv1 = ctx.wrap(nn.Conv2d(1, 64, 5))
-        self.bn1 = nn.BatchNorm2d(64, affine=True)
+        self.bn1 = ctx.bypass(nn.BatchNorm2d(64, affine=True))
         self.conv2 = ctx.wrap(nn.Conv2d(64, 96, 5))
-        self.bn2 = nn.BatchNorm2d(96, affine=True)
+        self.bn2 = ctx.bypass(nn.BatchNorm2d(96, affine=True))
         self.pool = nn.MaxPool2d(2)
         self.dropout = nn.Dropout(0.6)
-        self.fc1 = ctx.wrap(nn.Linear(16 * 96, 1024))
-        self.fc2 = ctx.wrap(nn.Linear(1024, 10))
+        self.fc1 = ctx.bypass(nn.Linear(16 * 96, 1024))
+        self.fc2 = ctx.bypass(nn.Linear(1024, 10))
 
     def encode(self, x):
         x = x.unsqueeze(1)
@@ -205,14 +204,15 @@ def train_pruned(args):
     if args.in_file:
         model.load(args.in_file)
     model = model.cuda()
-    ctx = model.ctx
-    model_params = ctx.list_mask_params(inverse=True)
+    ctx = model.g_ctx
+    ctx.print_info()
+    model_params = ctx.list_model_params()
     print("Unpruned parameters: {}".format(ctx.count_unpruned()))
-    model_optim = torch.optim.Adam(model_params, lr=5E-4, weight_decay=5E-5)
+    model_optim = torch.optim.Adam(model_params, lr=5E-4, weight_decay=5E-4)
     criterion = nn.CrossEntropyLoss()
 
     train_set, dev_set, test_set = SingleMnistDataset.splits(args)
-    train_loader = data.DataLoader(train_set, batch_size=64, shuffle=True, drop_last=True)
+    train_loader = data.DataLoader(train_set, batch_size=128, shuffle=True, drop_last=True)
     dev_loader = data.DataLoader(dev_set, batch_size=min(32, len(dev_set)))
     test_loader = data.DataLoader(test_set, batch_size=min(32, len(test_set)))
 
@@ -234,9 +234,10 @@ def train_pruned(args):
             model_optim.step()
 
             ctx.clip_all_masks()
-            if i % 200 == 0:
+            if i % 32 == 0:
                 n_unpruned = ctx.count_unpruned()
-                ctx.prune(10)
+                if n_unpruned > 20000 and n_epoch >= 1:
+                    ctx.prune(1)
                 accuracy = (torch.max(scores, 1)[1].view(model_in.size(0)).data == labels.data).sum() / model_in.size(0)
                 print("train accuracy: {:>10}, loss: {:>25}, unpruned: {}".format(accuracy, loss.data[0], n_unpruned))
         accuracy = 0
@@ -249,6 +250,7 @@ def train_pruned(args):
             accuracy += (torch.max(scores, 1)[1].view(model_in.size(0)).data == labels.data).sum()
             n += model_in.size(0)
         print("dev accuracy: {:>10}".format(accuracy / n))
+        torch.save(model.state_dict(), "test.pt")
         # if trainer.save(-accuracy):
         #     print("Saving...")
 
@@ -265,8 +267,6 @@ def train_pruned(args):
 
 def init_model(input_file=None, use_cuda=True):
     model.cuda()
-    if input_file:
-        model.load(input_file)
     model.eval()
 
 model = ConvModel()

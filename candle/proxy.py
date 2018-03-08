@@ -14,6 +14,13 @@ class Proxy(object):
         return []
 
     @property
+    def root(self):
+        return self
+
+    def print_info(self):
+        pass
+
+    @property
     def sizes(self):
         raise NotImplementedError
 
@@ -25,6 +32,13 @@ class ProxyDecorator(Proxy):
         super().__init__()
         self.child = child
 
+    @property
+    def root(self):
+        return self.child.root
+
+    def print_info(self):
+        self.child.print_info()
+
     def call(self, package, **kwargs):
         raise NotImplementedError
 
@@ -32,6 +46,21 @@ class ProxyDecorator(Proxy):
         if self.child is not None:
             package = self.child(*args, **kwargs)
         return self.call(package, **kwargs)
+
+class FakeProxy(Proxy):
+    def __init__(self, parameters):
+        super().__init__()
+        self.params = list(parameters)
+
+    def parameters(self):
+        return self.params
+
+    @property
+    def sizes(self):
+        return [p.size() for p in self.params]
+
+    def __call__(self):
+        raise ValueError("FakeProxy not callable!")
 
 class IdentityProxy(Proxy):
     def __init__(self, parameters):

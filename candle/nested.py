@@ -28,12 +28,12 @@ class Package(object):
             reified = flatten(reified)
         return reified
 
-    def _apply_function(self, function, elements):
-        return Package([self._apply_function(function, e.children) if isinstance(e, Package) else
+    def _apply_fn(self, function, elements):
+        return Package([self._apply_fn(function, e.children) if isinstance(e, Package) else
             function(e) for e in elements])
 
-    def apply_function(self, function):
-        return self._apply_function(function, self.children)
+    def apply_fn(self, function):
+        return self._apply_fn(function, self.children)
 
     def __getattribute__(self, name):
         def wrap_attr(attr_name, elements):
@@ -58,7 +58,7 @@ class Package(object):
             return get_attr if callable(getattr(self.children_type, name)) else get_attr()
 
         if name in ("children", "children_type", "__getattribute__", "_discover_type", 
-                "_build_children", "reify", "apply_function", "_apply_function"):
+                "_build_children", "reify", "apply_fn", "_apply_fn"):
             return object.__getattribute__(self, name)
         return wrap_attr(name, self.children)
 

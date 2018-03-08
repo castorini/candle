@@ -62,6 +62,10 @@ class Context(object):
     def list_providers(self):
         return self.list_proxies("weight_provider")
 
+    def print_info(self):
+        for proxy in self.list_proxies():
+            proxy.print_info()
+
     def list_params(self, filter_fn=None):
         all_proxies = self.list_proxies()
         if filter_fn is None:
@@ -107,6 +111,10 @@ class Context(object):
         wrapped_layer = self.compose(layer, **cfg)
         self.layers.append(wrapped_layer) # TODO: insert per-layer hyperparams (mask decay, etc) here if needed
         return wrapped_layer
+
+    def bypass(self, layer):
+        self.registry.register_proxy("fake", FakeProxy(layer.parameters()))
+        return layer
 
 class MixedContext(object):
     def __init__(self, config, *contexts, **kwargs):
