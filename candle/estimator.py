@@ -1,5 +1,6 @@
 from torch.autograd import Variable
 import torch
+import torch.autograd as ag
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
@@ -24,7 +25,7 @@ class BernoulliDistribution(ProbabilityDistribution):
         return theta * b + (1 - b) * (1 - theta)
 
     def diff(self, b, theta):
-        return b * 2 - 1
+        return (1 - theta + 1E-6)**(-b) * (b - theta) * (theta + 1E-6)**(b - 1)
 
     def draw(self, theta):
         return theta.clamp(0, 1).bernoulli()
@@ -73,7 +74,7 @@ class REINFORCEEstimator(GradientEstimator):
 REINFORCE with Importance Sampling Estimator
 """
 class RISEEstimator(GradientEstimator):
-    def __init__(self, f, p, p_i, alpha=0.95):
+    def __init__(self, f, p, p_i, alpha=0.99):
         self.f = f
         self.p = p
         self.p_i = p_i
@@ -109,4 +110,4 @@ class RISEEstimator(GradientEstimator):
         b = self.p_i.draw(pi)
         gis = self.f(b) * self.p.diff(b, theta) / (self.p_i(b, pi) + 1E-6)
         var_grad = self._compute_var_grad(b, theta, pi, gis)
-        return gis, var_grad
+        return gis, var_grad, self.f(b)
