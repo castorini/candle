@@ -4,4 +4,4 @@ from .nested import *
 from .proxy import *
 from .prune import *
 
-__all__ = ["context", "estimator", "proxy", "prune"]
+__all__ = ["context", "estimator", "nested", "proxy", "prune"]
