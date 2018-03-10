@@ -12,23 +12,29 @@ class Function(object):
     def __call__(self, *args, **kwargs):
         raise NotImplementedError
 
-class DifferentiableFunction(Function):
-    def diff(self, *args, **kwargs):
-        raise NotImplementedError
-
-class ProbabilityDistribution(DifferentiableFunction):
+class ProbabilityDistribution(Function):
     def draw(self, *args, **kwargs):
         raise NotImplementedError
 
 class BernoulliDistribution(ProbabilityDistribution):
-    def __call__(self, b, theta):
-        return theta * b + (1 - b) * (1 - theta)
+    def __init__(self, theta):
+        self.theta = theta
 
-    def diff(self, b, theta):
-        return (1 - theta + 1E-6)**(-b) * (b - theta) * (theta + 1E-6)**(b - 1)
+    def __call__(self, b):
+        return (self.theta + 1E-8)**b * (1 - self.theta + 1E-8)**(1 - b)
 
-    def draw(self, theta):
-        return theta.clamp(0, 1).bernoulli()
+    def draw(self):
+        return self.theta.clamp(0, 1).bernoulli()
+
+class SoftBernoulliDistribution(ProbabilityDistribution):
+    def __init__(self, theta):
+        self.theta = theta
+
+    def __call__(self, b):
+        return (self.theta.sigmoid() + 1E-8)**b * (1 - self.theta.sigmoid() + 1E-8)**(1 - b)
+
+    def draw(self):
+        return self.theta.sigmoid().bernoulli()
 
 class GradientEstimator(Function):
     def estimate_gradient(self, *args):
@@ -37,8 +43,77 @@ class GradientEstimator(Function):
     def __call__(self, *args):
         return self.estimate_gradient(*args)
 
-# class SimpleBernoulliReparameterization(ProbabilityDistribution):
-#     def __call__(self, )
+class ConcreteRelaxation(Function):
+    def __init__(self, temp):
+        self.temp = temp
+
+    def __call__(self, z):
+        return (z / self.temp).sigmoid()
+
+class BernoulliRelaxation(ProbabilityDistribution):
+    def __init__(self, theta):
+        self.theta = theta
+
+    def __call__(self, b):
+        raise NotImplementedError
+
+    def draw(self):
+        theta = self.theta.sigmoid()
+        u = theta.clone().uniform_()
+        l1 = theta.log() - (1 - theta).log()
+        l2 = u.log() - (1 - u).log()
+        return l1 + l2, u
+
+class ConditionedBernoulliRelaxation(BernoulliRelaxation):
+    def __call__(self, b):
+        raise NotImplementedError
+
+    def draw(self, b):
+        theta = self.theta.sigmoid()
+        v = theta.clone().uniform_()
+        t1 = 1 - theta
+        v = (v * t1) * (1 - b) + (v * theta + t1) * b
+        l1 = theta.log() - t1.log()
+        l2 = v.log() - (1 - v).log()
+        return l1 + l2, v
+
+class Heaviside(Function):
+    def __call__(self, x):
+        return x.clamp(0, 1).ceil()
+
+class REINFORCEEstimator(GradientEstimator):
+    def __init__(self, f, p):
+        self.f = f
+        self.p = p
+
+    def estimate_gradient(self, theta, b=None):
+        b = self.p.draw() if b is None else b
+        p = self.p(b)
+        f_b = self.f(b)
+        dlogp_dtheta = theta.apply_fn(lambda x, out: ag.grad([out], [x])[0], p.log())
+        return f_b * dlogp_dtheta
+
+"""
+REINFORCE with Importance Sampling Estimator
+"""
+class RISEEstimator(GradientEstimator):
+    def __init__(self, f, p, p_i, transform_fn=None):
+        self.f = f
+        self.p = p
+        self.p_i = p_i
+        self.transform_fn = transform_fn
+
+    def estimate_gradient(self, theta, pi, b=None):
+        b = self.p_i.draw() if b is None else b
+        h = b.apply_fn(self.transform_fn) if self.transform_fn else b
+        p = self.p(h)
+        p_i = self.p_i(b)
+        f_b = self.f(h)
+        dp_dtheta = theta.apply_fn(lambda x, out: ag.grad([out], [x])[0], p)
+
+        g_is = f_b * dp_dtheta / (p_i + 1E-8)
+        var_grad = pi.apply_fn(lambda x, out: ag.grad([out], [x])[0], g_is**2)
+        return g_is, var_grad
 
 """
 Implements RELAX estimator from "Backpropagation Through the Void..." paper
@@ -46,68 +121,64 @@ https://arxiv.org/abs/1711.00123
 Grathwohl et al. (2018)
 """
 class RELAXEstimator(GradientEstimator):
-    def __init__(self, f, c, p, z, z_tilde, H):
+    def __init__(self, f, c, p, z, z_tilde, H, transform_fn=None):
         self.f = f
         self.c = c
         self.p = p
         self.z = z
         self.z_tilde = z_tilde
+        self.transform_fn = transform_fn
         self.H = H
 
-    def estimate_gradient(self, theta):
-        z = self.z.draw(theta)
+    def estimate_gradient(self, theta, phi):
+        z, u = self.z.draw()
         b = self.H(z)
-        z_tilde = self.z_tilde.draw(theta, b)
-        dlogp = self.p.diff(b, theta) / self.p(b, theta)
-        return (self.f(b) - self.c(z_tilde)) * dlogp + self.c.diff(z) - self.c.diff(z_tilde)
+        zt, v = self.z_tilde.draw(b)
+        p = self.p(b)
+        c_phi_zt = self.c(theta, v)
+        dlogp_dtheta = theta.apply_fn(lambda x, out: ag.grad([out], [x], retain_graph=True)[0], p.log())
 
-class REINFORCEEstimator(GradientEstimator):
-    def __init__(self, f, p):
+        c_phi_z = self.c(theta, u)
+        dc_phi_z = theta.apply_fn(lambda x, out: ag.grad([out], [x], retain_graph=True)[0], c_phi_z)
+        dc_phi_zt = theta.apply_fn(lambda x, out: ag.grad([out], [x], retain_graph=True)[0], c_phi_zt)
+
+        g_relax = (self.f(b) - c_phi_zt) * dlogp_dtheta + dc_phi_z - dc_phi_zt
+        phi_grad = phi.apply_fn(lambda x, out: ag.grad([out], [x])[0], g_relax**2)
+        return g_relax, phi_grad
+
+class RICEEstimator(GradientEstimator):
+    def __init__(self, f, c, p, p_i, z, z_tilde, H, transform_fn=None):
         self.f = f
-        self.p = p
-
-    def estimate_gradient(self, theta):
-        b = self.p.draw(theta)
-        return self.f(b) * self.p.diff(b) / self.p(b, theta)
-
-"""
-REINFORCE with Importance Sampling Estimator
-"""
-class RISEEstimator(GradientEstimator):
-    def __init__(self, f, p, p_i, alpha=0.99):
-        self.f = f
+        self.c = c
         self.p = p
         self.p_i = p_i
-        self.alpha = alpha
-        self._running_mean = None
-        self._running_diff = None
+        self.z = z
+        self.z_tilde = z_tilde
+        self.transform_fn = transform_fn
+        self.H = H
 
-    def _update_running_mean(self, mean):
-        if self._running_mean is None:
-            self._running_mean = mean
-            return
-        self._running_mean = self.alpha * self._running_mean + (1 - self.alpha) * mean
+    def estimate_gradient(self, theta, pi, phi):
+        b = self.p_i.draw()
+        h = b.apply_fn(self.transform_fn) if self.transform_fn else b
+        p = self.p(h)
+        p_i = self.p_i(b)
+        f_b = self.f(h)
+        dp_dtheta = theta.apply_fn(lambda x, out: ag.grad([out], [x], retain_graph=True)[0], p)
 
-    def _update_running_diff(self, diff):
-        if self._running_diff is None:
-            self._running_diff = diff
-            return
-        self._running_diff = self.alpha * self._running_diff + (1 - self.alpha) * diff
+        g_is = f_b * dp_dtheta / (p_i + 1E-8)
+        var_grad = pi.apply_fn(lambda x, out: ag.grad([out], [x])[0], g_is**2)
 
-    def _compute_diff(self, b, theta, pi):
-        weight = self.p.diff(b, theta) * self.f(b)
-        return weight * (-1 / (self.p_i(b, pi)**2 + 1E-6)) * self.p_i.diff(b, pi)
+        z, u = self.z.draw()
+        b = self.H(z)
+        zt, v = self.z_tilde.draw(b)
+        p = self.p(b)
+        c_phi_zt = self.c(theta, v)
+        dlogp_dtheta = theta.apply_fn(lambda x, out: ag.grad([out], [x], retain_graph=True)[0], p.log())
 
-    def _compute_var_grad(self, b, theta, pi, gis):
-        diff = self._compute_diff(b, theta, pi)
-        self._update_running_diff(diff)
-        self._update_running_mean(gis)
-        pt1 = gis - self._running_mean
-        pt2 = diff - self._running_diff
-        return 2 * pt1 * pt2
+        c_phi_z = self.c(theta, u)
+        dc_phi_z = theta.apply_fn(lambda x, out: ag.grad([out], [x], retain_graph=True)[0], c_phi_z)
+        dc_phi_zt = theta.apply_fn(lambda x, out: ag.grad([out], [x], retain_graph=True)[0], c_phi_zt)
 
-    def estimate_gradient(self, theta, pi):
-        b = self.p_i.draw(pi)
-        gis = self.f(b) * self.p.diff(b, theta) / (self.p_i(b, pi) + 1E-6)
-        var_grad = self._compute_var_grad(b, theta, pi, gis)
-        return gis, var_grad, self.f(b)
+        g_rice = g_is - c_phi_zt * dlogp_dtheta + dc_phi_z - dc_phi_zt
+        phi_grad = phi.apply_fn(lambda x, out: ag.grad([out], [x])[0], g_rice**2)
+        return g_rice, var_grad, phi_grad

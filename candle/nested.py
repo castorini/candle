@@ -22,18 +22,28 @@ class Package(object):
                 return child._discover_type()
             return type(child)
 
+    @property
+    def singleton(self):
+        return self.children[0]
+
     def reify(self, flat=False):
         reified = [item.reify() if isinstance(item, Package) else item for item in self.children]
         if flat:
             reified = flatten(reified)
         return reified
 
-    def _apply_fn(self, function, elements):
-        return Package([self._apply_fn(function, e.children) if isinstance(e, Package) else
-            function(e) for e in elements])
+    def _apply_fn(self, function, elements, *args):
+        data = []
+        for params in zip(elements, *args):
+            e, p_args = params[0], params[1:]
+            if isinstance(e, Package):
+                data.append(self._apply_fn(function, e.children, *[arg.children for arg in p_args]))
+            else:
+                data.append(function(e, *p_args))
+        return Package(data)
 
-    def apply_fn(self, function):
-        return self._apply_fn(function, self.children)
+    def apply_fn(self, function, *args):
+        return self._apply_fn(function, self.children, *[arg.children for arg in args])
 
     def __getattribute__(self, name):
         def wrap_attr(attr_name, elements):
@@ -58,17 +68,19 @@ class Package(object):
             return get_attr if callable(getattr(self.children_type, name)) else get_attr()
 
         if name in ("children", "children_type", "__getattribute__", "_discover_type", 
-                "_build_children", "reify", "apply_fn", "_apply_fn"):
+                "_build_children", "reify", "apply_fn", "_apply_fn", "singleton"):
             return object.__getattribute__(self, name)
         return wrap_attr(name, self.children)
 
     def __add__(self, other): return self.__getattribute__("__add__")(other)
     def __sub__(self, other): return self.__getattribute__("__sub__")(other)
     def __mul__(self, other): return self.__getattribute__("__mul__")(other)
+    def __truediv__(self, other): return self.__getattribute__("__truediv__")(other)
+    def __floordiv__(self, other): return self.__getattribute__("__floordiv__")(other)
     def __div__(self, other): return self.__getattribute__("__div__")(other)
     def __mod__(self, other): return self.__getattribute__("__mod__")(other)
     def __divmod__(self, other): return self.__getattribute__("__divmod__")(other)
-    def __pow__(self, other, modulo): return self.__getattribute__("__pow__")(other, modulo)
+    def __pow__(self, other): return self.__getattribute__("__pow__")(other)
     def __lshift__(self, other): return self.__getattribute__("__lshift__")(other)
     def __rshift__(self, other): return self.__getattribute__("__rshift__")(other)
     def __and__(self, other): return self.__getattribute__("__and__")(other)
