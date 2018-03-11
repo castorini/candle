@@ -169,6 +169,7 @@ class Package(object):
     def __rand__(self, other): return self.__getattribute__("__rand__")(other)
     def __rxor__(self, other): return self.__getattribute__("__rxor__")(other)
     def __ror__(self, other): return self.__getattribute__("__ror__")(other)
+    def __len__(self): return self.__getattribute__("__len__")()
     def __neg__(self): return self.__getattribute__("__neg__")()
     def __pos__(self): return self.__getattribute__("__pos__")()
     def __abs__(self): return self.__getattribute__("__abs__")()
@@ -177,6 +178,7 @@ class Package(object):
     def __int__(self): return self.__getattribute__("__int__")()
     def __long__(self): return self.__getattribute__("__long__")()
     def __float__(self): return self.__getattribute__("__float__")()
+    def __call__(self, *args, **kwargs): return self.__getattribute__("__call__")(*args, **kwargs)
     def __getitem__(self, key): return self.__getattribute__("__getitem__")(key)
     def __setitem__(self, key, value): return self.__getattribute__("__setitem__")(key, value)
 

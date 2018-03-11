@@ -91,16 +91,17 @@ class RebarFunction(candle.Function):
     def __init__(self, function, temp):
         self.function = function
         self.temp = temp
+        self.concrete_fn = candle.ConcreteRelaxation(temp)
 
-    def __call__(self, x):
-        pass
+    def __call__(self, theta, noise):
+        return self.function(self.concrete_fn(theta))
 
 def train_relax(args, use_rebar=False):
     f = TuckerFunction(args.t)
     theta = candle.Package([nn.Parameter(torch.Tensor([0]))])
     if use_rebar:
         phi = candle.Package([nn.Parameter(torch.Tensor([0.5]))])
-        c = RebarFunction(f)
+        c = RebarFunction(f, phi)
     else:
         c = SimpleNet()
         phi = candle.Package(list(c.parameters()))
@@ -135,8 +136,8 @@ def train_rice(args):
     f = TuckerFunction(args.t)
     theta = candle.Package([nn.Parameter(torch.Tensor([0]))])
     pi = candle.Package([nn.Parameter(torch.Tensor([0]))])
-    c = SimpleNet()
-    phi = candle.Package(list(c.parameters()))
+    phi = candle.Package([nn.Parameter(torch.Tensor([0.5]))])
+    c = RebarFunction(f, phi)
 
     p = candle.SoftBernoulliDistribution(theta)
     p_i = candle.SoftBernoulliDistribution(pi)
@@ -183,7 +184,7 @@ def main():
             train_rice(args)
     parser = argparse.ArgumentParser()
     parser.add_argument("--lr", type=float, default=.01)
-    parser.add_argument("--steps", type=int, default=100000)
+    parser.add_argument("--steps", type=int, default=10000)
     parser.add_argument("--t", type=float, default=0.499)
     parser.add_argument("--type", type=str, default="relax")
     args, _ = parser.parse_known_args()

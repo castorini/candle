@@ -32,7 +32,7 @@ class WeightMaskGroup(ProxyDecorator):
     def print_info(self):
         super().print_info()
         new_size = int(self._flattened_masks[0].sum().cpu().data[0])
-        print("{}: {} => {}".format(type(self), self.child.sizes, new_size))
+        print("{}: {} => {}".format(type(self), self.child.sizes.reify(), new_size))
 
     @property
     def sizes(self):
@@ -47,7 +47,7 @@ class Channel2DMask(WeightMaskGroup):
         super().__init__(child, **kwargs)
 
     def build_masks(self, init_value):
-        return Package([nn.Parameter(init_value * torch.ones(self.child.sizes[0][0]))])
+        return Package([nn.Parameter(init_value * torch.ones(self.child.sizes.reify()[0][0]))])
 
     def split(self, root):
         param = root.parameters()[0]
@@ -58,7 +58,7 @@ class Channel2DMask(WeightMaskGroup):
         mask = self._flattened_masks[0]
         if self.stochastic:
             mask = mask.clamp(0, 1).bernoulli()
-        sizes = self.child.sizes[0]
+        sizes = self.child.sizes.reify()[0]
         expand_weight = mask.expand(sizes[3], sizes[2], sizes[1], -1).permute(3, 2, 1, 0)
         expand_bias = mask
         return Package([expand_weight, expand_bias])
@@ -68,7 +68,7 @@ class LinearRowMask(WeightMaskGroup):
         super().__init__(child, **kwargs)
 
     def build_masks(self, init_value):
-        return Package([nn.Parameter(init_value * torch.ones(self.child.sizes[0][0]))])
+        return Package([nn.Parameter(init_value * torch.ones(self.child.sizes.reify()[0][0]))])
 
     def split(self, root):
         return Package([root.parameters()[0].permute(1, 0)])
@@ -77,18 +77,18 @@ class LinearRowMask(WeightMaskGroup):
         mask = self._flattened_masks[0]
         if self.stochastic:
             mask = mask.clamp(0, 1).bernoulli()
-        expand_weight = mask.expand(self.child.sizes[0][1], -1).permute(1, 0)
+        expand_weight = mask.expand(self.child.sizes.reify()[0][1], -1).permute(1, 0)
         expand_bias = mask
         return Package([expand_weight, expand_bias])
 
 class LinearColMask(WeightMaskGroup):
     def __init__(self, child, **kwargs):
         super().__init__(child, **kwargs)
-        self._dummy = nn.Parameter(torch.ones(child.sizes[1][0]))
+        self._dummy = nn.Parameter(torch.ones(child.sizes.reify()[1][0]))
         self._flattened_masks.append(self._dummy)
 
     def build_masks(self, init_value):
-        return Package([nn.Parameter(init_value * torch.ones(self.child.sizes[0][1]))])
+        return Package([nn.Parameter(init_value * torch.ones(self.child.sizes.reify()[0][1]))])
 
     def split(self, root):
         return Package([root.parameters()[0]])
@@ -97,7 +97,7 @@ class LinearColMask(WeightMaskGroup):
         mask = self._flattened_masks[0]
         if self.stochastic:
             mask = mask.clamp(0, 1).bernoulli()
-        expand_weight = mask.expand(self.child.sizes[0][0], -1)
+        expand_weight = mask.expand(self.child.sizes.reify()[0][0], -1)
         expand_bias = self._dummy
         return Package([expand_weight, expand_bias])
 
@@ -106,7 +106,7 @@ class WeightMask(ProxyDecorator):
         super().__init__(child)
         def create_mask(size):
             return nn.Parameter(torch.ones(*size) * init_value)
-        self.masks = child.package.size().apply_fn(create_mask)
+        self.masks = child.sizes.reify().apply_fn(create_mask)
         self._flattened_masks = self.masks.reify(flat=True)
         self.stochastic = stochastic
 

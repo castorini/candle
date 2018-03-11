@@ -94,8 +94,8 @@ class REINFORCEEstimator(GradientEstimator):
         b = self.p.draw() if b is None else b
         p = self.p(b)
         f_b = self.f(b)
-        dlogp_dtheta = theta.apply_fn(lambda x, out: ag.grad([out], [x])[0], p.log())
-        return f_b * dlogp_dtheta
+        dlogp_dtheta = theta.apply_fn(lambda x, out: ag.grad([out.sum()], [x])[0], p.log())
+        return dlogp_dtheta * f_b
 
 """
 REINFORCE with Importance Sampling Estimator
