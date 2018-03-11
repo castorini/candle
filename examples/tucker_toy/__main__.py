@@ -18,9 +18,9 @@ class TuckerFunction(candle.Function):
 
 def train_reinforce(args):
     f = TuckerFunction(args.t)
-    p = candle.SoftBernoulliDistribution()
-    estimator = candle.REINFORCEEstimator(f, p)
     theta = candle.Package([nn.Parameter(torch.Tensor([0]))])
+    p = candle.SoftBernoulliDistribution(theta)
+    estimator = candle.REINFORCEEstimator(f, p)
     optimizer = optim.Adam([theta.singleton], args.lr)
 
     losses = []
@@ -28,7 +28,7 @@ def train_reinforce(args):
     for step in range(args.steps):
         optimizer.zero_grad()
         theta_grad = estimator.estimate_gradient(theta)
-        loss = f(p.draw(theta))
+        loss = f(p.draw())
         losses.append(loss.data[0].reify()[0])
         estimates.append(theta_grad.data[0].reify()[0])
         if len(losses) > 400:
@@ -43,11 +43,11 @@ def train_reinforce(args):
 
 def train_rise(args):
     f = TuckerFunction(args.t)
-    p = candle.SoftBernoulliDistribution()
-    p_i = candle.SoftBernoulliDistribution()
-    estimator = candle.RISEEstimator(f, p, p_i)
     theta = candle.Package([nn.Parameter(torch.Tensor([0]))])
     pi = candle.Package([nn.Parameter(torch.Tensor([0]))])
+    p = candle.SoftBernoulliDistribution(theta)
+    p_i = candle.SoftBernoulliDistribution(pi)
+    estimator = candle.RISEEstimator(f, p, p_i)
     optimizer = optim.Adam([theta.singleton, pi.singleton], args.lr)
 
     losses = []
@@ -55,7 +55,7 @@ def train_rise(args):
     for step in range(args.steps):
         optimizer.zero_grad()
         theta_grad, pi_grad = estimator.estimate_gradient(theta, pi)
-        loss = f(p.draw(theta)) * 100
+        loss = f(p.draw()) * 100
         losses.append(loss.data[0].reify()[0])
         estimates.append(theta_grad.data[0].reify()[0])
         if len(losses) >= 400:
@@ -87,18 +87,30 @@ class SimpleNet(nn.Module):
         x = self.lin2(x)
         return candle.Package([x])
 
-def train_relax(args):
+class RebarFunction(candle.Function):
+    def __init__(self, function, temp):
+        self.function = function
+        self.temp = temp
+
+    def __call__(self, x):
+        pass
+
+def train_relax(args, use_rebar=False):
     f = TuckerFunction(args.t)
     theta = candle.Package([nn.Parameter(torch.Tensor([0]))])
-    c = SimpleNet()
-    phi = candle.Package(list(c.parameters()))
+    if use_rebar:
+        phi = candle.Package([nn.Parameter(torch.Tensor([0.5]))])
+        c = RebarFunction(f)
+    else:
+        c = SimpleNet()
+        phi = candle.Package(list(c.parameters()))
 
     p = candle.SoftBernoulliDistribution(theta)
     z = candle.BernoulliRelaxation(theta)
     z_tilde = candle.ConditionedBernoulliRelaxation(theta)
 
     estimator = candle.RELAXEstimator(f, c, p, z, z_tilde, candle.Heaviside())
-    optimizer = optim.Adam([theta.singleton, phi.singleton], args.lr)
+    optimizer = optim.Adam([theta.singleton] + phi.reify(flat=True), args.lr)
 
     losses = []
     estimates = []
@@ -116,7 +128,7 @@ def train_relax(args):
             estimates = []
         
         theta.singleton.grad = theta_grad.reify()[0].detach()
-        phi.singleton.grad = phi_grad.reify()[0].detach()
+        phi.iter_fn(candle.apply_gradient, phi_grad)
         optimizer.step()
 
 def train_rice(args):
@@ -151,7 +163,7 @@ def train_rice(args):
         
         theta.singleton.grad = theta_grad.reify()[0].detach()
         pi.singleton.grad = pi_grad.reify()[0].detach()
-        phi.singleton.grad = phi_grad.reify()[0].detach()
+        phi.iter_fn(candle.apply_gradient, phi_grad)
         optimizer.step()
 
 def main():
@@ -163,13 +175,15 @@ def main():
             train_reinforce(args)
         elif name == "relax":
             train_relax(args)
+        elif name == "rebar":
+            train_relax(args, use_rebar=True)
         elif name == "rise":
             train_rise(args)
         elif name == "rice":
             train_rice(args)
     parser = argparse.ArgumentParser()
     parser.add_argument("--lr", type=float, default=.01)
-    parser.add_argument("--steps", type=int, default=10000)
+    parser.add_argument("--steps", type=int, default=100000)
     parser.add_argument("--t", type=float, default=0.499)
     parser.add_argument("--type", type=str, default="relax")
     args, _ = parser.parse_known_args()

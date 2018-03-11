@@ -81,6 +81,10 @@ class Heaviside(Function):
     def __call__(self, x):
         return x.clamp(0, 1).ceil()
 
+class Round(Function):
+    def __call__(self, x):
+        return x.round()
+
 class REINFORCEEstimator(GradientEstimator):
     def __init__(self, f, p):
         self.f = f
@@ -143,8 +147,9 @@ class RELAXEstimator(GradientEstimator):
         dc_phi_zt = theta.apply_fn(lambda x, out: ag.grad([out], [x], retain_graph=True)[0], c_phi_zt)
 
         g_relax = (self.f(b) - c_phi_zt) * dlogp_dtheta + dc_phi_z - dc_phi_zt
-        phi_grad = phi.apply_fn(lambda x, out: ag.grad([out], [x])[0], g_relax**2)
-        return g_relax, phi_grad
+        var_estimate = (g_relax**2).singleton
+        phi_grad = ag.grad([var_estimate], phi.reify())
+        return g_relax, Package(list(phi_grad))
 
 class RICEEstimator(GradientEstimator):
     def __init__(self, f, c, p, p_i, z, z_tilde, H, transform_fn=None):
@@ -166,7 +171,7 @@ class RICEEstimator(GradientEstimator):
         dp_dtheta = theta.apply_fn(lambda x, out: ag.grad([out], [x], retain_graph=True)[0], p)
 
         g_is = f_b * dp_dtheta / (p_i + 1E-8)
-        var_grad = pi.apply_fn(lambda x, out: ag.grad([out], [x])[0], g_is**2)
+        var_grad = Package(list(ag.grad((g_is**2).singleton, pi.reify())))
 
         z, u = self.z.draw()
         b = self.H(z)
@@ -180,5 +185,6 @@ class RICEEstimator(GradientEstimator):
         dc_phi_zt = theta.apply_fn(lambda x, out: ag.grad([out], [x], retain_graph=True)[0], c_phi_zt)
 
         g_rice = g_is - c_phi_zt * dlogp_dtheta + dc_phi_z - dc_phi_zt
-        phi_grad = phi.apply_fn(lambda x, out: ag.grad([out], [x])[0], g_rice**2)
-        return g_rice, var_grad, phi_grad
+        var_estimate = (g_rice**2).singleton
+        phi_grad = ag.grad([var_estimate], phi.reify())
+        return g_rice, var_grad, Package(list(phi_grad))
