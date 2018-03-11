@@ -1,8 +1,35 @@
+def debug_print(name=""):
+    def arg_wrap(function):
+        def print_wrap(*args, **kwargs):
+            x = function(*args, **kwargs)
+            print(f"{name}", x.reify() if isinstance(x, Package) else x)
+            return x
+        return print_wrap
+    return arg_wrap
+
+def apply_gradient(x, grad):
+    x.grad = grad.detach()
+
+class Applicator(object):
+    def __init__(self, package):
+        self.package = package
+        self.shape = package.nested_shape
+        self.items = []
+
+    def append(self, item):
+        self.items.append(item)
+
+    def __iter__(self):
+        return iter(self.package.reify(flat=True))
+
+    def build(self):
+        return Package.reshape_into(self.shape, self.items)
+
 class Package(object):
     """
     Convenience data structure for performing operations on nested list groups. For example,
-    a = Package(["a", "b", ["d", "e"]])
-    (a + " ").reify() ==> ["a ", "b ", ["d ", "e "]]
+    a = Package(["a bowl of rice", "burrito boys", ["hi", "no one"]])
+    (len(a.split())).reify() ==> [4, 2, [1, 2]]
     """
 
     def __init__(self, children, children_type=None):
@@ -32,6 +59,38 @@ class Package(object):
             reified = flatten(reified)
         return reified
 
+    @classmethod
+    def _reshape_into(cls, shape, flat_list):
+        data = []
+        for e in shape:
+            if isinstance(e, list):
+                data.append(cls.reshape_into(e, flat_list))
+                flat_list = flat_list[1:]
+            else:
+                data.extend(flat_list[:e])
+                flat_list = flat_list[e:]
+        return data
+
+    @classmethod
+    def reshape_into(cls, shape, flat_list):
+        return cls(cls._reshape_into(shape, flat_list))
+
+    @property
+    def nested_shape(self):
+        shapes = []
+        shape = 0
+        for e in self.children:
+            if isinstance(e, Package):
+                if shape:
+                    shapes.append(shape)
+                    shape = 0
+                shapes.append(e.nested_shape)
+            else:
+                shape += 1
+        if shape:
+            shapes.append(shape)
+        return shapes
+
     def _apply_fn(self, function, elements, *args):
         data = []
         for params in zip(elements, *args):
@@ -44,6 +103,17 @@ class Package(object):
 
     def apply_fn(self, function, *args):
         return self._apply_fn(function, self.children, *[arg.children for arg in args])
+
+    def _iter_fn(self, function, elements, *args):
+        for params in zip(elements, *args):
+            e, p_args = params[0], params[1:]
+            if isinstance(e, Package):
+                self._iter_fn(function, e.children, *[arg.children for arg in p_args])
+            else:
+                function(e, *p_args)
+
+    def iter_fn(self, function, *args):
+        self._iter_fn(function, self.children, *[arg.children for arg in args])
 
     def __getattribute__(self, name):
         def wrap_attr(attr_name, elements):
@@ -67,8 +137,9 @@ class Package(object):
                 return Package(new_elems)
             return get_attr if callable(getattr(self.children_type, name)) else get_attr()
 
-        if name in ("children", "children_type", "__getattribute__", "_discover_type", 
-                "_build_children", "reify", "apply_fn", "_apply_fn", "singleton"):
+        if name in ("children", "children_type", "__getattribute__", "_discover_type", "iter_fn",
+                "_build_children", "reify", "apply_fn", "_apply_fn", "singleton", "_iter_fn", 
+                "nested_shape", "reshape_into", "_reshape_into"):
             return object.__getattribute__(self, name)
         return wrap_attr(name, self.children)
 
