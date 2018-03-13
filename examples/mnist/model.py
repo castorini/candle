@@ -116,7 +116,7 @@ class DNNModel(SerializableModule):
 class LeNet(SerializableModule):
     def __init__(self):
         super().__init__()
-        self.g_ctx = ctx = candle.GroupPruneContext()
+        self.g_ctx = ctx = candle.GroupPruneContext(stochastic=True)
         self.net = nn.Sequential(
             ctx.wrap(nn.Linear(784, 300), prune="in"),
             nn.Tanh(),
@@ -132,7 +132,7 @@ class LeNet(SerializableModule):
 class LeNet5(SerializableModule):
     def __init__(self):
         super().__init__()
-        self.g_ctx = ctx = candle.GroupPruneContext()
+        self.g_ctx = ctx = candle.GroupPruneContext(stochastic=True)
         self.convnet = nn.Sequential(
             ctx.wrap(nn.Conv2d(1, 6, 5)),
             nn.Tanh(),
@@ -200,7 +200,7 @@ class TinyModel(SerializableModule):
         return self.fc(x.view(x.size(0), -1))
 
 def train_pruned(args):
-    model = ConvModel()
+    model = LeNet()
     if args.in_file:
         model.load(args.in_file)
     model = model.cuda()
@@ -232,7 +232,7 @@ def train_pruned(args):
             labels = Variable(labels.cuda(), requires_grad=False)
 
             scores = model(model_in)
-            loss = criterion(scores, labels) + ctx.l0_loss(5 / 60000) # number of data points
+            loss = criterion(scores, labels) + ctx.l0_loss(1.5 / 50000) # number of data points
             loss.backward()
             model_optim.step()
 

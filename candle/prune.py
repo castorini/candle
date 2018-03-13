@@ -36,7 +36,7 @@ class WeightMaskGroup(ProxyDecorator):
 
     @property
     def n_groups(self):
-        total_params = sum(self.child.sizes.apply_fn(np.prod).reify(flat=True))
+        total_params = sum((self.expand_masks() != 0).float().sum().data[0].reify(flat=True))
         group_params = sum(self.masks.numel().reify(flat=True))
         return float(total_params / group_params)
 
@@ -50,12 +50,13 @@ class WeightMaskGroup(ProxyDecorator):
         return self._flattened_masks
 
     @property
-    def n_unpruned(self):
-        return int((self.expand_masks() != 0).float().sum().cpu().data[0].singleton)
+    def mask_unpruned(self):
+        if self.stochastic:
+            return (self.concrete_fn().clamp(0, 1) != 0).long().sum().data[0].reify()
 
     def print_info(self):
         super().print_info()
-        print("{}: {} => {}".format(type(self), self.child.sizes.reify(), self.n_unpruned))
+        print("{}: {} => {}".format(type(self), self.child.sizes.reify(), self.mask_unpruned))
 
     @property
     def sizes(self):
