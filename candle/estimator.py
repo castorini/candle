@@ -1,3 +1,5 @@
+import gc
+
 from torch.autograd import Variable
 import torch
 import torch.autograd as ag
@@ -11,6 +13,15 @@ from .nested import *
 class Function(object):
     def __call__(self, *args, **kwargs):
         raise NotImplementedError
+
+class RebarFunction(Function):
+    def __init__(self, function, temp):
+        self.function = function
+        self.temp = temp
+        self.concrete_fn = ConcreteRelaxation(temp)
+
+    def __call__(self, theta, noise):
+        return self.function(self.concrete_fn(theta))
 
 class ProbabilityDistribution(Function):
     def draw(self, *args, **kwargs):
@@ -113,10 +124,10 @@ class RISEEstimator(GradientEstimator):
         p = self.p(h)
         p_i = self.p_i(b)
         f_b = self.f(h)
-        dp_dtheta = theta.apply_fn(lambda x, out: ag.grad([out], [x])[0], p)
+        dp_dtheta = theta.apply_fn(lambda x, out: ag.grad([out.sum()], [x])[0], p)
 
-        g_is = f_b * dp_dtheta / (p_i + 1E-8)
-        var_grad = pi.apply_fn(lambda x, out: ag.grad([out], [x])[0], g_is**2)
+        g_is = dp_dtheta * f_b / (p_i + 1E-8)
+        var_grad = pi.apply_fn(lambda x, out: ag.grad([out.sum()], [x], retain_graph=True)[0], g_is**2)
         return g_is, var_grad
 
 """
@@ -140,16 +151,17 @@ class RELAXEstimator(GradientEstimator):
         zt, v = self.z_tilde.draw(b)
         p = self.p(b)
         c_phi_zt = self.c(theta, v)
-        dlogp_dtheta = theta.apply_fn(lambda x, out: ag.grad([out], [x], retain_graph=True)[0], p.log())
+        dlogp_dtheta = theta.apply_fn(lambda x, out: ag.grad([out.sum()], [x], retain_graph=True)[0], p.log())
 
         c_phi_z = self.c(theta, u)
-        dc_phi_z = theta.apply_fn(lambda x, out: ag.grad([out], [x], retain_graph=True)[0], c_phi_z)
-        dc_phi_zt = theta.apply_fn(lambda x, out: ag.grad([out], [x], retain_graph=True)[0], c_phi_zt)
+        dc_phi_z = theta.apply_fn(lambda x: ag.grad([c_phi_z], [x], retain_graph=True)[0])
+        dc_phi_zt = theta.apply_fn(lambda x: ag.grad([c_phi_zt], [x], retain_graph=True)[0])
 
-        g_relax = (self.f(b) - c_phi_zt) * dlogp_dtheta + dc_phi_z - dc_phi_zt
-        var_estimate = (g_relax**2).singleton
-        phi_grad = ag.grad([var_estimate], phi.reify())
-        return g_relax, Package(list(phi_grad))
+        g_relax = dlogp_dtheta * (self.f(b) - c_phi_zt) + dc_phi_z - dc_phi_zt
+        var_estimate = (g_relax**2)
+        phi_grad = phi.apply_fn(lambda x, y: ag.grad([y.sum()], [x], retain_graph=True)[0], var_estimate)
+        gc.collect()
+        return g_relax, phi_grad
 
 class RICEEstimator(GradientEstimator):
     def __init__(self, f, c, p, p_i, z, z_tilde, H, transform_fn=None):

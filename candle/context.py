@@ -53,7 +53,7 @@ class Context(object):
         self.cache = Memoizer()
 
     def build_provider(self, layer):
-        return IdentityProxy(layer.parameters())
+        return IdentityProxy(layer, layer.parameters())
 
     def list_proxies(self, proxy_type=None, proxy_class=None):
         return self.cache("proxies.{}.{}".format(proxy_type, proxy_class),
@@ -100,7 +100,7 @@ class Context(object):
             bidirectional, dropout = layer.bidirectional, layer.dropout
             base = ProxyRNNBase(mode, input_size, hidden_size, num_layers=num_layers,
                 bias=bias, batch_first=batch_first, bidirectional=bidirectional, dropout=dropout)
-            provider = IdentityProxy(layer.all_weights)
+            provider = IdentityProxy(layer, layer.all_weights)
             return ProxyRNN(base, provider, **kwargs)
         else:
             raise ValueError("Unsupported!")
@@ -113,7 +113,7 @@ class Context(object):
         return wrapped_layer
 
     def bypass(self, layer):
-        self.registry.register_proxy("fake", FakeProxy(layer.parameters()))
+        self.registry.register_proxy("fake", FakeProxy(layer, layer.parameters()))
         return layer
 
 class MixedContext(object):

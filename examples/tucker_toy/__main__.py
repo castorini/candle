@@ -87,21 +87,12 @@ class SimpleNet(nn.Module):
         x = self.lin2(x)
         return candle.Package([x])
 
-class RebarFunction(candle.Function):
-    def __init__(self, function, temp):
-        self.function = function
-        self.temp = temp
-        self.concrete_fn = candle.ConcreteRelaxation(temp)
-
-    def __call__(self, theta, noise):
-        return self.function(self.concrete_fn(theta))
-
 def train_relax(args, use_rebar=False):
     f = TuckerFunction(args.t)
     theta = candle.Package([nn.Parameter(torch.Tensor([0]))])
     if use_rebar:
         phi = candle.Package([nn.Parameter(torch.Tensor([0.5]))])
-        c = RebarFunction(f, phi)
+        c = candle.RebarFunction(f, phi)
     else:
         c = SimpleNet()
         phi = candle.Package(list(c.parameters()))

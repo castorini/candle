@@ -7,8 +7,9 @@ import numpy as np
 from .nested import Package
 
 class Proxy(object):
-    def __init__(self):
+    def __init__(self, layer):
         self.child = None
+        self.layer = layer
 
     def parameters(self):
         return []
@@ -28,9 +29,10 @@ class Proxy(object):
         raise NotImplementedError
 
 class ProxyDecorator(Proxy):
-    def __init__(self, child):
-        super().__init__()
+    def __init__(self, layer, child):
+        super().__init__(layer)
         self.child = child
+        self.layer = layer
 
     @property
     def root(self):
@@ -45,11 +47,13 @@ class ProxyDecorator(Proxy):
     def __call__(self, *args, **kwargs):
         if self.child is not None:
             package = self.child(*args, **kwargs)
-        return self.call(package, **kwargs)
+            return self.call(package, **kwargs)
+        else:
+            return self.call(*args, **kwargs)
 
 class FakeProxy(Proxy):
-    def __init__(self, parameters):
-        super().__init__()
+    def __init__(self, layer, parameters):
+        super().__init__(layer)
         self.params = list(parameters)
 
     def parameters(self):
@@ -63,8 +67,8 @@ class FakeProxy(Proxy):
         raise ValueError("FakeProxy not callable!")
 
 class IdentityProxy(Proxy):
-    def __init__(self, parameters):
-        super().__init__()
+    def __init__(self, layer, parameters):
+        super().__init__(layer)
         self.package = Package(list(parameters))
         self._flattened_params = self.package.reify(flat=True)
 
@@ -107,17 +111,17 @@ class ProxyLayer(nn.Module):
         return self._find_provider(provider_type, self.weight_provider)
 
     def hook_weight(self, weight_proxy, **kwargs):
-        self.weight_provider = weight_proxy(self.weight_provider, **kwargs)
+        self.weight_provider = weight_proxy(self, self.weight_provider, **kwargs)
         self._register_all_params("weight_hook", self.weight_provider)
         return self.weight_provider
 
     def hook_output(self, output_proxy, **kwargs):
-        self.output_proxy = output_proxy(self.output_proxy, **kwargs)
+        self.output_proxy = output_proxy(self, self.output_proxy, **kwargs)
         self._register_all_params("output_hook", self.output_proxy)
         return self.output_proxy
 
     def hook_input(self, input_proxy, **kwargs):
-        self.input_proxy = input_proxy(self.input_proxy, **kwargs)
+        self.input_proxy = input_proxy(self, self.input_proxy, **kwargs)
         self._register_all_params("input_hook", self.input_proxy)
         return self.input_proxy
 

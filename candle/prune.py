@@ -7,15 +7,23 @@ import torch.nn.functional as F
 import numpy as np
 
 from .context import Context
+from .estimator import Function
 from .nested import *
 from .proxy import *
 
 class WeightMaskGroup(ProxyDecorator):
-    def __init__(self, child, init_value=1, stochastic=False):
-        super().__init__(child)
-        self.masks = self.build_masks(init_value)
+    def __init__(self, layer, child, init_value=1, stochastic=False):
+        super().__init__(layer, child)
         self.stochastic = stochastic
+        self.masks = self.build_masks(init_value)
         self._flattened_masks = self.masks.reify(flat=True)
+
+    def _build_masks(self, init_value, sizes):
+        if self.stochastic:
+            self.concrete_fn = HardConcreteFunction.build(self.layer, sizes)
+            return self.concrete_fn.parameters()
+        else:
+            return Package([nn.Parameter(init_value * torch.ones(sizes))])
 
     def expand_masks(self):
         raise NotImplementedError
@@ -26,13 +34,28 @@ class WeightMaskGroup(ProxyDecorator):
     def split(self):
         raise NotImplementedError
 
+    @property
+    def n_groups(self):
+        total_params = sum(self.child.sizes.apply_fn(np.prod).reify(flat=True))
+        group_params = sum(self.masks.numel().reify(flat=True))
+        return float(total_params / group_params)
+
+    def l0_loss(self, lambd):
+        if not self.stochastic:
+            raise ValueError("Mask group must be in stochastic mode!")
+        cdf_gt0 = self.concrete_fn.cdf_gt0()
+        return lambd * (self.n_groups * cdf_gt0).sum().singleton
+
     def parameters(self):
         return self._flattened_masks
 
+    @property
+    def n_unpruned(self):
+        return int((self.expand_masks() != 0).float().sum().cpu().data[0].singleton)
+
     def print_info(self):
         super().print_info()
-        new_size = int(self._flattened_masks[0].sum().cpu().data[0])
-        print("{}: {} => {}".format(type(self), self.child.sizes.reify(), new_size))
+        print("{}: {} => {}".format(type(self), self.child.sizes.reify(), self.n_unpruned))
 
     @property
     def sizes(self):
@@ -42,12 +65,51 @@ class WeightMaskGroup(ProxyDecorator):
         masks = self.expand_masks()
         return input * masks
 
+class HardConcreteFunction(Function):
+    """
+    From Learning Sparse Neural Networks Through L_0 Regularization 
+    Louizos et al. (2018)
+    """
+
+    def __init__(self, context, alpha, beta, gamma=-0.1, zeta=1.1):
+        self.alpha = alpha
+        self.beta = beta
+        self.gamma = gamma
+        self.zeta = zeta
+        self.sizes = alpha.size()
+        self.context = context
+
+    def __call__(self):
+        self.beta.data.clamp_(1E-8, 1E8)
+        self.alpha.data.clamp_(1E-8, 1E8)
+        if self.context.training:
+            u = self.alpha.apply_fn(lambda x: x.clone().uniform_())
+            s = (u.log() - (1 - u).log() + self.alpha.log()) / (self.beta + 1E-6)
+            mask = s.sigmoid() * (self.zeta - self.gamma) + self.gamma
+        else:
+            mask = self.alpha.log().sigmoid() * (self.zeta - self.gamma) + self.gamma
+        return mask
+
+    def cdf_gt0(self):
+        return (self.alpha.log() - self.beta * np.log(-self.gamma / self.zeta)).sigmoid()
+
+    def parameters(self):
+        return Package([self.alpha, self.beta])
+
+    @classmethod
+    def build(cls, context, sizes, **kwargs):
+        if not isinstance(sizes, Package):
+            sizes = Package([sizes])
+        alpha = sizes.apply_fn(lambda x: nn.Parameter(torch.Tensor(x).normal_(0, 0.01).exp()))
+        beta = sizes.apply_fn(lambda x: nn.Parameter(torch.Tensor(x).fill_(2 / 3)))
+        return cls(context, alpha, beta, **kwargs)
+
 class Channel2DMask(WeightMaskGroup):
-    def __init__(self, child, **kwargs):
-        super().__init__(child, **kwargs)
+    def __init__(self, layer, child, **kwargs):
+        super().__init__(layer, child, **kwargs)
 
     def build_masks(self, init_value):
-        return Package([nn.Parameter(init_value * torch.ones(self.child.sizes.reify()[0][0]))])
+        return self._build_masks(init_value, self.child.sizes.reify()[0][0])
 
     def split(self, root):
         param = root.parameters()[0]
@@ -55,55 +117,52 @@ class Channel2DMask(WeightMaskGroup):
         return Package([split_root])
 
     def expand_masks(self):
-        mask = self._flattened_masks[0]
         if self.stochastic:
-            mask = mask.clamp(0, 1).bernoulli()
+            mask = self.concrete_fn().clamp(0, 1).singleton
+        else:
+            mask = self._flattened_masks[0]
         sizes = self.child.sizes.reify()[0]
         expand_weight = mask.expand(sizes[3], sizes[2], sizes[1], -1).permute(3, 2, 1, 0)
         expand_bias = mask
         return Package([expand_weight, expand_bias])
 
 class LinearRowMask(WeightMaskGroup):
-    def __init__(self, child, **kwargs):
-        super().__init__(child, **kwargs)
+    def __init__(self, layer, child, **kwargs):
+        super().__init__(layer, child, **kwargs)
 
     def build_masks(self, init_value):
-        return Package([nn.Parameter(init_value * torch.ones(self.child.sizes.reify()[0][0]))])
+        return self._build_masks(init_value, self.child.sizes.reify()[0][0])
 
     def split(self, root):
         return Package([root.parameters()[0].permute(1, 0)])
 
     def expand_masks(self):
-        mask = self._flattened_masks[0]
-        if self.stochastic:
-            mask = mask.clamp(0, 1).bernoulli()
+        mask = self.concrete_fn().clamp(0, 1).singleton if self.stochastic else self._flattened_masks[0]
         expand_weight = mask.expand(self.child.sizes.reify()[0][1], -1).permute(1, 0)
         expand_bias = mask
         return Package([expand_weight, expand_bias])
 
 class LinearColMask(WeightMaskGroup):
-    def __init__(self, child, **kwargs):
-        super().__init__(child, **kwargs)
+    def __init__(self, layer, child, **kwargs):
+        super().__init__(layer, child, **kwargs)
         self._dummy = nn.Parameter(torch.ones(child.sizes.reify()[1][0]))
         self._flattened_masks.append(self._dummy)
 
     def build_masks(self, init_value):
-        return Package([nn.Parameter(init_value * torch.ones(self.child.sizes.reify()[0][1]))])
+        return self._build_masks(init_value, self.child.sizes.reify()[0][1])
 
     def split(self, root):
         return Package([root.parameters()[0]])
 
     def expand_masks(self):
-        mask = self._flattened_masks[0]
-        if self.stochastic:
-            mask = mask.clamp(0, 1).bernoulli()
+        mask = self.concrete_fn().clamp(0, 1).singleton if self.stochastic else self._flattened_masks[0]
         expand_weight = mask.expand(self.child.sizes.reify()[0][0], -1)
         expand_bias = self._dummy
         return Package([expand_weight, expand_bias])
 
 class WeightMask(ProxyDecorator):
-    def __init__(self, child, init_value=1, stochastic=False):
-        super().__init__(child)
+    def __init__(self, layer, child, init_value=1, stochastic=False):
+        super().__init__(layer, child)
         def create_mask(size):
             return nn.Parameter(torch.ones(*size) * init_value)
         self.masks = child.sizes.reify().apply_fn(create_mask)
@@ -190,6 +249,13 @@ class GroupPruneContext(PruneContext):
         layer.hook_weight(self.find_mask_type(type(layer), kwargs.get("prune", "out")), stochastic=self.stochastic)
         return layer
 
+    def l0_loss(self, lambd):
+        group_masks = self.list_proxies("weight_hook", WeightMaskGroup)
+        loss = 0
+        for mask in group_masks:
+            loss = loss + mask.l0_loss(lambd)
+        return loss
+
     def find_mask_type(self, layer_type, prune="out"):
         if layer_type == ProxyLinear and prune == "out":
             return LinearRowMask
@@ -207,7 +273,7 @@ class GroupPruneContext(PruneContext):
 
     def count_unpruned(self):
         group_masks = self.list_proxies("weight_hook", WeightMaskGroup)
-        return sum(sum(m.expand_masks().sum().cpu().data[0].reify(flat=True)) for m in group_masks)
+        return sum(sum((m.expand_masks() != 0).float().sum().cpu().data[0].reify(flat=True)) for m in group_masks)
 
     def prune(self, percentage, method="l2_norm", method_map=_group_rank_methods, mask_type=WeightMaskGroup):
         super().prune(percentage, method, method_map, mask_type)

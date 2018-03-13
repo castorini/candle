@@ -173,6 +173,8 @@ class Package(object):
     def __neg__(self): return self.__getattribute__("__neg__")()
     def __pos__(self): return self.__getattribute__("__pos__")()
     def __abs__(self): return self.__getattribute__("__abs__")()
+    def __ne__(self, other): return self.__getattribute__("__ne__")(other)
+    def __eq__(self, other): return self.__getattribute__("__eq__")(other)
     def __invert__(self): return self.__getattribute__("__invert__")()
     def __complex__(self): return self.__getattribute__("__complex__")()
     def __int__(self): return self.__getattribute__("__int__")()
