@@ -115,16 +115,19 @@ class Package(object):
     def apply_fn(self, function, *args, depth_limit=1E10):
         return self._apply_fn(function, self.children, *[arg.children for arg in args], depth_limit=depth_limit)
 
-    def _iter_fn(self, function, elements, *args):
+    def _iter_fn(self, function, elements, *args, depth_limit=1E10):
         for params in zip(elements, *args):
             e, p_args = params[0], params[1:]
-            if isinstance(e, Package):
-                self._iter_fn(function, e.children, *[arg.children for arg in p_args])
+            if isinstance(e, Package) and depth_limit != 0:
+                self._iter_fn(function, e.children, *[arg.children for arg in p_args], 
+                    depth_limit=depth_limit - 1)
+            elif isinstance(e, Package) and depth_limit == 0:
+                function(e.children, *[arg.children for arg in p_args])
             else:
                 function(e, *p_args)
 
-    def iter_fn(self, function, *args):
-        self._iter_fn(function, self.children, *[arg.children for arg in args])
+    def iter_fn(self, function, *args, depth_limit=1E10):
+        self._iter_fn(function, self.children, *[arg.children for arg in args], depth_limit=depth_limit)
 
     def __getattribute__(self, name):
         def wrap_attr(attr_name, elements):

@@ -4,5 +4,6 @@ from .nested import *
 from .proxy import *
 from .prune import *
 from .quantize import *
+from .regularize import *
 
-__all__ = ["context", "estimator", "nested", "proxy", "prune", "quantize", "stochastic"]
+__all__ = ["context", "estimator", "nested", "proxy", "prune", "quantize", "regularize"]
