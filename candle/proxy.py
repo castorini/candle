@@ -231,6 +231,8 @@ class ProxyRNN(ProxyLayer):
 
     def on_forward(self, x, *args, **kwargs):
         self.child._inject(self.weight_provider().reify())
-        val = self.child(x, *args, **kwargs)
-        self.child._uninject()
+        try:
+            val = self.child(x, *args, **kwargs)
+        finally:
+            self.child._uninject()
         return val
