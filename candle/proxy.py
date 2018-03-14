@@ -6,12 +6,25 @@ import numpy as np
 
 from .nested import Package
 
+class SerializableModule(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def save(self, filename):
+        torch.save(self.state_dict(), filename)
+
+    def load(self, filename):
+        self.load_state_dict(torch.load(filename, map_location=lambda storage, loc: storage))
+
 class Proxy(object):
     def __init__(self, layer):
         self.child = None
         self.layer = layer
 
     def parameters(self):
+        return []
+
+    def buffers(self):
         return []
 
     @property
@@ -98,6 +111,9 @@ class ProxyLayer(nn.Module):
         i = 0
         for i, parameter in enumerate(proxy.parameters()):
             self.register_parameter("proxy.{}".format(self._param_idx + i), parameter)
+        self._param_idx += i + 1
+        for i, buf in enumerate(proxy.buffers()):
+            self.register_buffer("buffer.{}".format(self._param_idx + i), buf)
         self._param_idx += i + 1
 
     def _find_provider(self, provider_type, provider):

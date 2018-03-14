@@ -49,12 +49,20 @@ class Package(object):
                 return child._discover_type()
             return type(child)
 
-    @property
-    def singleton(self):
-        return self.children[0]
+    def singleton(self, recursive=False):
+        children = self.children
+        if not recursive:
+            return children[0]
+        while isinstance(children[0], Package):
+            children = children[0].children
+        return children[0]
 
-    def reify(self, flat=False):
-        reified = [item.reify() if isinstance(item, Package) else item for item in self.children]
+    def reify(self, flat=False, depth_limit=1E10):
+        if depth_limit == 0:
+            reified = [item.children if isinstance(item, Package) else item for item in self.children]
+        else:
+            reified = [item.reify(depth_limit=depth_limit - 1) if isinstance(item, Package) 
+                else item for item in self.children]
         if flat:
             reified = flatten(reified)
         return reified
@@ -91,18 +99,21 @@ class Package(object):
             shapes.append(shape)
         return shapes
 
-    def _apply_fn(self, function, elements, *args):
+    def _apply_fn(self, function, elements, *args, depth_limit=1E10):
         data = []
         for params in zip(elements, *args):
             e, p_args = params[0], params[1:]
-            if isinstance(e, Package):
-                data.append(self._apply_fn(function, e.children, *[arg.children for arg in p_args]))
+            if isinstance(e, Package) and depth_limit != 0:
+                data.append(self._apply_fn(function, e.children, *[arg.children for arg in p_args], 
+                    depth_limit=depth_limit - 1))
+            elif isinstance(e, Package) and depth_limit == 0:
+                data.append(function(e.children, *[arg.children for arg in p_args]))
             else:
                 data.append(function(e, *p_args))
         return Package(data)
 
-    def apply_fn(self, function, *args):
-        return self._apply_fn(function, self.children, *[arg.children for arg in args])
+    def apply_fn(self, function, *args, depth_limit=1E10):
+        return self._apply_fn(function, self.children, *[arg.children for arg in args], depth_limit=depth_limit)
 
     def _iter_fn(self, function, elements, *args):
         for params in zip(elements, *args):
@@ -129,7 +140,9 @@ class Package(object):
                 for i, element in enumerate(elements):
                     new_args = (args[i],) if use_pkg_iter else args
                     if isinstance(element, Package):
-                        new_elem = wrap_attr(attr_name, element.children)(*new_args, **kwargs)
+                        new_elem = wrap_attr(attr_name, element.children)
+                        if callable(new_elem) and not isinstance(new_elem, Package):
+                            new_elem = new_elem(*new_args, **kwargs)
                     else:
                         attr = getattr(element, attr_name)
                         new_elem = attr(*new_args, **kwargs) if callable(attr) else attr

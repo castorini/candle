@@ -180,6 +180,18 @@ class ConvModel(SerializableModule):
         x = self.dropout(F.relu(self.fc1(x)))
         return self.fc2(x)
 
+class RecurrentModel(SerializableModule):
+    def __init__(self):
+        super().__init__()
+        self.g_ctx = ctx = candle.GroupPruneContext(stochastic=True)
+        self.rnn = ctx.wrap(nn.GRU(28, 1024, 1, batch_first=True))
+        self.fc2 = ctx.bypass(nn.Linear(1024, 10))
+
+    def forward(self, x):
+        x = x.view(x.size(0), 28, 28)
+        _, out = self.rnn(x)
+        return self.fc2(out.permute(1, 2, 0).contiguous().squeeze(2))
+
 class TinyModel(SerializableModule):
     def __init__(self):
         super().__init__()
@@ -201,6 +213,7 @@ class TinyModel(SerializableModule):
 
 def train_pruned(args):
     model = LeNet()
+    model = RecurrentModel()
     if args.in_file:
         model.load(args.in_file)
     model = model.cuda()
@@ -208,8 +221,8 @@ def train_pruned(args):
     model.eval()
     ctx.print_info()
     model.train()
-    # model_params = ctx.list_params()
-    model_params = ctx.list_model_params()
+    model_params = ctx.list_params()
+    # model_params = ctx.list_model_params()
     print("Unpruned parameters: {}".format(ctx.count_unpruned()))
     model_optim = torch.optim.Adam(model_params, lr=5E-4) # incompatible with normal weight decay
     criterion = nn.CrossEntropyLoss()
@@ -232,11 +245,11 @@ def train_pruned(args):
             labels = Variable(labels.cuda(), requires_grad=False)
 
             scores = model(model_in)
-            loss = criterion(scores, labels) + ctx.l0_loss(1.5 / 50000) # number of data points
+            loss = criterion(scores, labels) + ctx.l0_loss(1E-1 / 50000) # number of data points
             loss.backward()
             model_optim.step()
 
-            ctx.clip_all_masks()
+            # ctx.clip_all_masks()
             if i % 32 == 0:
                 n_unpruned = ctx.count_unpruned()
                 accuracy = (torch.max(scores, 1)[1].view(model_in.size(0)).data == labels.data).sum() / model_in.size(0)

@@ -94,7 +94,7 @@ class Context(object):
                 raise ValueError("Unsupported!")
         elif isinstance(layer, nn.Linear):
             return ProxyLinear(provider, **kwargs)
-        elif isinstance(layer, nn.layers.rnn.RNNBase):
+        elif isinstance(layer, nn.modules.rnn.RNNBase):
             mode, input_size, hidden_size = layer.mode, layer.input_size, layer.hidden_size
             num_layers, bias, batch_first = layer.num_layers, layer.bias, layer.batch_first
             bidirectional, dropout = layer.bidirectional, layer.dropout

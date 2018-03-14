@@ -21,7 +21,7 @@ def train_reinforce(args):
     theta = candle.Package([nn.Parameter(torch.Tensor([0]))])
     p = candle.SoftBernoulliDistribution(theta)
     estimator = candle.REINFORCEEstimator(f, p)
-    optimizer = optim.Adam([theta.singleton], args.lr)
+    optimizer = optim.Adam([theta.singleton()], args.lr)
 
     losses = []
     estimates = []
@@ -38,7 +38,7 @@ def train_reinforce(args):
             losses = []
             estimates = []
 
-        theta.singleton.grad = theta_grad.reify()[0]
+        theta.singleton().grad = theta_grad.reify()[0]
         optimizer.step()
 
 def train_rise(args):
@@ -48,7 +48,7 @@ def train_rise(args):
     p = candle.SoftBernoulliDistribution(theta)
     p_i = candle.SoftBernoulliDistribution(pi)
     estimator = candle.RISEEstimator(f, p, p_i)
-    optimizer = optim.Adam([theta.singleton, pi.singleton], args.lr)
+    optimizer = optim.Adam([theta.singleton(), pi.singleton()], args.lr)
 
     losses = []
     estimates = []
@@ -65,8 +65,8 @@ def train_rise(args):
             losses = []
             estimates = []
         
-        pi.singleton.grad = pi_grad.reify()[0]
-        theta.singleton.grad = theta_grad.reify()[0]
+        pi.singleton().grad = pi_grad.reify()[0]
+        theta.singleton().grad = theta_grad.reify()[0]
         optimizer.step()
 
 class SimpleNet(nn.Module):
@@ -102,7 +102,7 @@ def train_relax(args, use_rebar=False):
     z_tilde = candle.ConditionedBernoulliRelaxation(theta)
 
     estimator = candle.RELAXEstimator(f, c, p, z, z_tilde, candle.Heaviside())
-    optimizer = optim.Adam([theta.singleton] + phi.reify(flat=True), args.lr)
+    optimizer = optim.Adam([theta.singleton()] + phi.reify(flat=True), args.lr)
 
     losses = []
     estimates = []
@@ -119,7 +119,7 @@ def train_relax(args, use_rebar=False):
             losses = []
             estimates = []
         
-        theta.singleton.grad = theta_grad.reify()[0].detach()
+        theta.singleton().grad = theta_grad.reify()[0].detach()
         phi.iter_fn(candle.apply_gradient, phi_grad)
         optimizer.step()
 
@@ -136,7 +136,7 @@ def train_rice(args):
     z_tilde = candle.ConditionedBernoulliRelaxation(theta)
 
     estimator = candle.RICEEstimator(f, c, p, p_i, z, z_tilde, candle.Heaviside())
-    optimizer = optim.Adam([theta.singleton, pi.singleton, phi.singleton], args.lr)
+    optimizer = optim.Adam([theta.singleton(), pi.singleton(), phi.singleton()], args.lr)
 
     losses = []
     estimates = []
@@ -153,8 +153,8 @@ def train_rice(args):
             losses = []
             estimates = []
         
-        theta.singleton.grad = theta_grad.reify()[0].detach()
-        pi.singleton.grad = pi_grad.reify()[0].detach()
+        theta.singleton().grad = theta_grad.reify()[0].detach()
+        pi.singleton().grad = pi_grad.reify()[0].detach()
         phi.iter_fn(candle.apply_gradient, phi_grad)
         optimizer.step()
 

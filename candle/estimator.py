@@ -183,7 +183,7 @@ class RICEEstimator(GradientEstimator):
         dp_dtheta = theta.apply_fn(lambda x, out: ag.grad([out], [x], retain_graph=True)[0], p)
 
         g_is = f_b * dp_dtheta / (p_i + 1E-8)
-        var_grad = Package(list(ag.grad((g_is**2).singleton, pi.reify())))
+        var_grad = Package(list(ag.grad((g_is**2).singleton(), pi.reify())))
 
         z, u = self.z.draw()
         b = self.H(z)
@@ -197,6 +197,6 @@ class RICEEstimator(GradientEstimator):
         dc_phi_zt = theta.apply_fn(lambda x, out: ag.grad([out], [x], retain_graph=True)[0], c_phi_zt)
 
         g_rice = g_is - c_phi_zt * dlogp_dtheta + dc_phi_z - dc_phi_zt
-        var_estimate = (g_rice**2).singleton
+        var_estimate = (g_rice**2).singleton()
         phi_grad = ag.grad([var_estimate], phi.reify())
         return g_rice, var_grad, Package(list(phi_grad))

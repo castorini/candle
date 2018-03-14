@@ -18,9 +18,9 @@ class WeightMaskGroup(ProxyDecorator):
         self.masks = self.build_masks(init_value)
         self._flattened_masks = self.masks.reify(flat=True)
 
-    def _build_masks(self, init_value, sizes):
+    def _build_masks(self, init_value, sizes, randomized_eval=False):
         if self.stochastic:
-            self.concrete_fn = HardConcreteFunction.build(self.layer, sizes)
+            self.concrete_fn = HardConcreteFunction.build(self.layer, sizes, randomized_eval=randomized_eval)
             return self.concrete_fn.parameters()
         else:
             return Package([nn.Parameter(init_value * torch.ones(sizes))])
@@ -44,7 +44,7 @@ class WeightMaskGroup(ProxyDecorator):
         if not self.stochastic:
             raise ValueError("Mask group must be in stochastic mode!")
         cdf_gt0 = self.concrete_fn.cdf_gt0()
-        return lambd * (self.n_groups * cdf_gt0).sum().singleton
+        return lambd * sum((self.n_groups * cdf_gt0).sum().reify(flat=True))
 
     def parameters(self):
         return self._flattened_masks
@@ -72,18 +72,19 @@ class HardConcreteFunction(Function):
     Louizos et al. (2018)
     """
 
-    def __init__(self, context, alpha, beta, gamma=-0.1, zeta=1.1):
+    def __init__(self, context, alpha, beta, gamma=-0.1, zeta=1.1, randomized_eval=False):
         self.alpha = alpha
         self.beta = beta
         self.gamma = gamma
         self.zeta = zeta
         self.sizes = alpha.size()
         self.context = context
+        self.randomized_eval = randomized_eval
 
     def __call__(self):
         self.beta.data.clamp_(1E-8, 1E8)
         self.alpha.data.clamp_(1E-8, 1E8)
-        if self.context.training:
+        if self.context.training or self.randomized_eval:
             u = self.alpha.apply_fn(lambda x: x.clone().uniform_())
             s = (u.log() - (1 - u).log() + self.alpha.log()) / (self.beta + 1E-6)
             mask = s.sigmoid() * (self.zeta - self.gamma) + self.gamma
@@ -105,6 +106,33 @@ class HardConcreteFunction(Function):
         beta = sizes.apply_fn(lambda x: nn.Parameter(torch.Tensor(x).fill_(2 / 3)))
         return cls(context, alpha, beta, **kwargs)
 
+class RNNMask(WeightMaskGroup):
+    def __init__(self, layer, child, **kwargs):
+        super().__init__(layer, child, **kwargs)
+        self.expand_masks()
+
+    def build_masks(self, init_value): # TODO: bidirectional support
+        sizes = self.child.sizes.reify()
+        self._expand_size = Package([[size[1][0] // size[1][1]] * 4 for size in sizes])
+        mask_sizes = [size[1][1] for size in sizes]
+        return self._build_masks(init_value, mask_sizes, randomized_eval=True)
+
+    def expand_masks(self):
+        def expand_mask(size, mask, expand_size):
+            for _ in range(len(size) - 1):
+                mask = mask.unsqueeze(0)
+            if len(size) == 2:
+                return mask.expand(size[1], -1).repeat(1, expand_size).permute(1, 0)
+            else:
+                return mask.repeat(expand_size)
+        if self.stochastic:
+            mask = self.concrete_fn().clamp(0, 1).singleton()
+        else:
+            raise ValueError("Only stochastic masks supported currently!")
+        mask_package = Package([[m] * 4 for m in mask.reify()])
+        expand_weight = self.child.sizes.apply_fn(expand_mask, mask_package, self._expand_size)
+        return expand_weight
+
 class Channel2DMask(WeightMaskGroup):
     def __init__(self, layer, child, **kwargs):
         super().__init__(layer, child, **kwargs)
@@ -119,7 +147,7 @@ class Channel2DMask(WeightMaskGroup):
 
     def expand_masks(self):
         if self.stochastic:
-            mask = self.concrete_fn().clamp(0, 1).singleton
+            mask = self.concrete_fn().clamp(0, 1).singleton()
         else:
             mask = self._flattened_masks[0]
         sizes = self.child.sizes.reify()[0]
@@ -138,7 +166,7 @@ class LinearRowMask(WeightMaskGroup):
         return Package([root.parameters()[0].permute(1, 0)])
 
     def expand_masks(self):
-        mask = self.concrete_fn().clamp(0, 1).singleton if self.stochastic else self._flattened_masks[0]
+        mask = self.concrete_fn().clamp(0, 1).singleton() if self.stochastic else self._flattened_masks[0]
         expand_weight = mask.expand(self.child.sizes.reify()[0][1], -1).permute(1, 0)
         expand_bias = mask
         return Package([expand_weight, expand_bias])
@@ -156,7 +184,7 @@ class LinearColMask(WeightMaskGroup):
         return Package([root.parameters()[0]])
 
     def expand_masks(self):
-        mask = self.concrete_fn().clamp(0, 1).singleton if self.stochastic else self._flattened_masks[0]
+        mask = self.concrete_fn().clamp(0, 1).singleton() if self.stochastic else self._flattened_masks[0]
         expand_weight = mask.expand(self.child.sizes.reify()[0][0], -1)
         expand_bias = self._dummy
         return Package([expand_weight, expand_bias])
@@ -264,6 +292,8 @@ class GroupPruneContext(PruneContext):
             return LinearColMask
         elif layer_type == ProxyConv2d  and prune == "out":
             return Channel2DMask
+        elif layer_type == ProxyRNN:
+            return RNNMask
         else:
             raise ValueError("Layer type unsupported!")
 
