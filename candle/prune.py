@@ -6,7 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
-from .context import Context
+from .context import *
 from .estimator import Function
 from .nested import *
 from .proxy import *
@@ -16,7 +16,15 @@ class WeightMaskGroup(ProxyDecorator):
         super().__init__(layer, child)
         self.stochastic = stochastic
         self.masks = self.build_masks(init_value)
+        self.frozen = False
         self._flattened_masks = self.masks.reify(flat=True)
+        self.cache = Memoizer()
+        self._reset_buffers()
+
+    def _reset_buffers(self):
+        if not self.stochastic:
+            return
+        self._frozen_samples = self.concrete_fn().clamp(0, 1).detach().data.reify(flat=True)
 
     def _build_masks(self, init_value, sizes, randomized_eval=False):
         if self.stochastic:
@@ -24,6 +32,29 @@ class WeightMaskGroup(ProxyDecorator):
             return self.concrete_fn.parameters()
         else:
             return Package([nn.Parameter(init_value * torch.ones(sizes))])
+
+    def buffers(self):
+        if self.stochastic:
+            return [(f"frozen_samples{i}", sample) for i, sample in enumerate(self._frozen_samples)]
+        return []
+
+    @property
+    def frozen_samples(self):
+        def fetch_samples():
+            samples = []
+            for i in range(1000000):
+                try:
+                    samples.append(Variable(getattr(self.layer, f"frozen_samples{i}")))
+                except AttributeError:
+                    break
+            return Package.reshape_into(self.concrete_fn().nested_shape, samples)
+        return self.cache("_samples", fetch_samples)
+
+    @frozen_samples.setter
+    def frozen_samples(self, samples):
+        for i, sample in enumerate(samples.data.reify(flat=True)):
+            getattr(self.layer, f"frozen_samples{i}").copy_(sample)
+        self.cache.delete("_samples")
 
     def expand_masks(self):
         raise NotImplementedError
@@ -49,10 +80,24 @@ class WeightMaskGroup(ProxyDecorator):
     def parameters(self):
         return self._flattened_masks
 
+    def sample_concrete(self):
+        if not self.stochastic:
+            raise ValueError("Mask group must be in stochastic mode!")
+        return self.frozen_samples if self.frozen else self.concrete_fn().clamp(0, 1)
+
     @property
     def mask_unpruned(self):
         if self.stochastic:
-            return (self.concrete_fn().clamp(0, 1) != 0).long().sum().data[0].reify()
+            return (self.sample_concrete() != 0).long().sum().data[0].reify()
+
+    def freeze(self, refresh=True):
+        if not self.stochastic or self.frozen:
+            return
+        self.frozen = True
+        self.frozen_samples = self.concrete_fn().clamp(0, 1).detach()
+
+    def unfreeze(self):
+        self.frozen = False
 
     def print_info(self):
         super().print_info()
@@ -126,7 +171,7 @@ class RNNMask(WeightMaskGroup):
             else:
                 return mask.repeat(expand_size)
         if self.stochastic:
-            mask = self.concrete_fn().clamp(0, 1).singleton()
+            mask = self.sample_concrete().singleton()
         else:
             raise ValueError("Only stochastic masks supported currently!")
         mask_package = Package([[m] * 4 for m in mask.reify()])
@@ -147,7 +192,7 @@ class Channel2DMask(WeightMaskGroup):
 
     def expand_masks(self):
         if self.stochastic:
-            mask = self.concrete_fn().clamp(0, 1).singleton()
+            mask = self.sample_concrete().singleton()
         else:
             mask = self._flattened_masks[0]
         sizes = self.child.sizes.reify()[0]
@@ -166,7 +211,7 @@ class LinearRowMask(WeightMaskGroup):
         return Package([root.parameters()[0].permute(1, 0)])
 
     def expand_masks(self):
-        mask = self.concrete_fn().clamp(0, 1).singleton() if self.stochastic else self._flattened_masks[0]
+        mask = self.sample_concrete().singleton() if self.stochastic else self._flattened_masks[0]
         expand_weight = mask.expand(self.child.sizes.reify()[0][1], -1).permute(1, 0)
         expand_bias = mask
         return Package([expand_weight, expand_bias])
@@ -269,9 +314,10 @@ class PruneContext(Context):
                     mask.data.view(-1)[indices.data] = 0
 
 class GroupPruneContext(PruneContext):
-    def __init__(self, stochastic=False, **kwargs):
+    def __init__(self, stochastic=False, frozen=False, **kwargs):
         super().__init__(**kwargs)
         self.stochastic = stochastic
+        self.frozen = frozen
 
     def compose(self, layer, **kwargs):
         layer = super().compose(layer, **kwargs)
@@ -284,6 +330,16 @@ class GroupPruneContext(PruneContext):
         for mask in group_masks:
             loss = loss + mask.l0_loss(lambd)
         return loss
+
+    def freeze(self, refresh=True):
+        group_masks = self.list_proxies("weight_hook", WeightMaskGroup)
+        for mask in group_masks:
+            mask.freeze(refresh=refresh)
+
+    def unfreeze(self):
+        group_masks = self.list_proxies("weight_hook", WeightMaskGroup)
+        for mask in group_masks:
+            mask.unfreeze()
 
     def find_mask_type(self, layer_type, prune="out"):
         if layer_type == ProxyLinear and prune == "out":

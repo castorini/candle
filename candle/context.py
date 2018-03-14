@@ -39,6 +39,12 @@ class Memoizer(object):
     def wrap(self, function, *args, **kwargs):
         return lambda: function(*args, **kwargs)
 
+    def delete(self, name):
+        try:
+            del self.cache[name]
+        except:
+            pass
+
     def __call__(self, key, not_present_fn, refresh=False):
         if refresh or key not in self.cache:
             self.cache[key] = not_present_fn()
@@ -71,6 +77,12 @@ class Context(object):
         if filter_fn is None:
             return list(itertools.chain.from_iterable(p.parameters() for p in all_proxies))
         return list(itertools.chain.from_iterable(p.parameters() for p in filter(filter_fn, all_proxies)))
+
+    def list_buffers(self, filter_fn=None):
+        all_proxies = self.list_proxies()
+        if filter_fn is None:
+            return list(itertools.chain.from_iterable(p.buffers() for p in all_proxies))
+        return list(itertools.chain.from_iterable(p.buffers() for p in filter(filter_fn, all_proxies)))
 
     def compose(self, layer, **cfg):
         if isinstance(layer, ProxyLayer):
