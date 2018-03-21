@@ -25,9 +25,9 @@ class RNNWeightDrop(ProxyDecorator):
     def call(self, input):
         def apply_dropout(layer_weights):
             if self.mode == "hidden":
-                F.dropout(layer_weights[1], inplace=True, training=self.layer.training, p=self.p)
+                layer_weights[1] = F.dropout(layer_weights[1], training=self.layer.training, p=self.p)
             elif self.mode == "input":
-                F.dropout(layer_weights[0], inplace=True, training=self.layer.training, p=self.p)
+                layer_weights[0] = F.dropout(layer_weights[0], training=self.layer.training, p=self.p)
             else:
                 raise ValueError(f"{self.mode} not supported!")
         weights = input.reify()
@@ -35,5 +35,5 @@ class RNNWeightDrop(ProxyDecorator):
             if self.layer_indices and i not in self.layer_indices:
                 continue
             apply_dropout(x)
-        return input
+        return Package.reshape_into(input.nested_shape, flatten(weights))
 

@@ -123,6 +123,13 @@ class ProxyLayer(nn.Module):
             return None
         return self._find_provider(provider_type, provider.child)
 
+    def disable_hooks(self):
+        self.weight_provider = self.weight_provider.root
+        if self.output_proxy is not None:
+            self.output_proxy = self.output_proxy.root
+        if self.input_proxy is not None:
+            self.input_proxy = self.input_proxy.root
+
     def find_provider(self, provider_type):
         return self._find_provider(provider_type, self.weight_provider)
 

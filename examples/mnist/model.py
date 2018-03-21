@@ -1,122 +1,19 @@
+from __future__ import print_function
 import argparse
-import io
-import os
-import random
-
-from PIL import Image
-from torch.autograd import Variable
-from torch.optim.lr_scheduler import ExponentialLR
-import cv2
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.utils.data as data
+import torch.optim as optim
+from torchvision import datasets, transforms
+
+from torch.autograd import Variable
 
 import candle
 
-class SerializableModule(nn.Module):
+class LeNet(nn.Module):
     def __init__(self):
         super().__init__()
-
-    def save(self, filename):
-        torch.save(self.state_dict(), filename)
-
-    def load(self, filename):
-        self.load_state_dict(torch.load(filename, map_location=lambda storage, loc: storage))
-
-def read_idx(bytes):
-    reader = io.BytesIO(bytes)
-    reader.read(3)
-    n_dims = int.from_bytes(reader.read(1), byteorder="big")
-    sizes = []
-    for _ in range(n_dims):
-        sizes.append(int.from_bytes(reader.read(4), byteorder="big"))
-    size = int(np.prod(sizes))
-    buf = reader.read(size)
-    return np.frombuffer(buf, dtype=np.uint8).reshape(sizes)
-
-class SingleMnistDataset(data.Dataset):
-    def __init__(self, images, labels, is_training):
-        self.clean_images = []
-        self.clean_labels = []
-        for image, label in zip(images, labels):
-            image = np.transpose(image)
-            self.clean_images.append(Image.fromarray(image))
-            self.clean_labels.append(int(label))
-        self.is_training = is_training
-
-    @classmethod
-    def splits(cls, config, **kwargs):
-        data_dir = config.dir
-        img_files = [os.path.join(data_dir, "train-images-idx3-ubyte"),
-            os.path.join(data_dir, "t10k-images-idx3-ubyte")]
-        image_sets = []
-        for image_set in img_files:
-            with open(image_set, "rb") as f:
-                content = f.read()
-            arr = read_idx(content)
-            image_sets.append(arr)
-
-        lbl_files = [os.path.join(data_dir, "train-labels-idx1-ubyte"),
-            os.path.join(data_dir, "t10k-labels-idx1-ubyte")]
-        lbl_sets = []
-        for lbl_set in lbl_files:
-            with open(lbl_set, "rb") as f:
-                content = f.read()
-            lbl_sets.append(read_idx(content).astype(np.int))
-
-        dev_images = image_sets[0][-2500:]
-        image_sets[0] = image_sets[0][:-2500]
-        image_sets.append(dev_images)
-        dev_lbls = lbl_sets[0][-2500:]
-        lbl_sets[0] = lbl_sets[0][:-2500]
-        lbl_sets.append(dev_lbls)
-        return cls(image_sets[0], lbl_sets[0], True, **kwargs), cls(image_sets[2], lbl_sets[2], False, **kwargs), \
-            cls(image_sets[1], lbl_sets[1], False, **kwargs)
-
-    def __getitem__(self, index):
-        lbl = self.clean_labels[index]
-        img = self.clean_images[index]
-        arr = np.array(img)
-        if isinstance(model, LeNet5):
-            arr = np.pad(arr, ((2, 2), (2, 2)), "constant")
-        if random.random() < 0.5 and self.is_training:
-            arr = np.roll(arr, random.randint(-2, 2), 0)
-            arr = np.roll(arr, random.randint(-2, 2), 1)
-        arr = arr.astype(np.float32)
-        arr = (arr / 255) * 2 - 1
-        return torch.from_numpy(arr), lbl
-
-    def __len__(self):
-        return len(self.clean_images)
-
-class DNNModel(SerializableModule):
-    def __init__(self):
-        super().__init__()
-        self.use_cuda = True
-        def make_hidden(n_in, n_out):
-            return nn.Sequential(
-                ctx.pruned(nn.Linear(n_in, n_out)),
-                nn.BatchNorm1d(n_out),
-                nn.Tanh())
-        ctx = candle.Context(candle.read_config(), mask_decay=5E-3)
-        n_units = 2048
-        mod_list = [make_hidden(784, n_units)]
-        mod_list.extend(make_hidden(n_units, n_units) for _ in range(3))
-        mod_list.append(ctx.pruned(nn.Linear(n_units, 10)))
-        self.layers = nn.ModuleList(mod_list)
-
-    def forward(self, x):
-        x = x.view(x.size(0), -1)
-        for l in self.layers:
-            x = l(x)
-        return x
-
-class LeNet(SerializableModule):
-    def __init__(self):
-        super().__init__()
-        self.g_ctx = ctx = candle.GroupPruneContext(stochastic=True)
+        self.ctx = ctx = candle.GroupPruneContext(stochastic=True)
         self.net = nn.Sequential(
             ctx.wrap(nn.Linear(784, 300), prune="in"),
             nn.Tanh(),
@@ -126,13 +23,13 @@ class LeNet(SerializableModule):
 
     def forward(self, x):
         x = x.view(x.size(0), -1)
-        return self.net(x)
+        return F.log_softmax(self.net(x), dim=1)
 
 # https://github.com/activatedgeek/LeNet-5/blob/master/lenet.py
-class LeNet5(SerializableModule):
+class LeNet5(nn.Module): # broken right now
     def __init__(self):
         super().__init__()
-        self.g_ctx = ctx = candle.GroupPruneContext(stochastic=True)
+        self.ctx = ctx = candle.GroupPruneContext(stochastic=True)
         self.convnet = nn.Sequential(
             ctx.wrap(nn.Conv2d(1, 6, 5)),
             nn.Tanh(),
@@ -152,152 +49,136 @@ class LeNet5(SerializableModule):
         x = x.unsqueeze(1)
         x = self.convnet(x)
         x = x.view(-1, 16 * 25)
-        return self.fc(x)
+        return F.log_softmax(self.fc(x), dim=1)
 
-class ConvModel(SerializableModule):
+class PTNet(nn.Module):
     def __init__(self):
         super().__init__()
-        self.use_cuda = True
-        self.g_ctx = ctx = candle.GroupPruneContext(stochastic=True)
-        self.conv1 = ctx.wrap(nn.Conv2d(1, 64, 5))
-        self.bn1 = ctx.bypass(nn.BatchNorm2d(64, affine=True))
-        self.conv2 = ctx.wrap(nn.Conv2d(64, 96, 5))
-        self.bn2 = ctx.bypass(nn.BatchNorm2d(96, affine=True))
-        self.pool = nn.MaxPool2d(2)
-        self.dropout = nn.Dropout(0.6)
-        self.fc1 = ctx.bypass(nn.Linear(16 * 96, 1024))
-        self.fc2 = ctx.bypass(nn.Linear(1024, 10))
-
-    def encode(self, x):
-        x = x.unsqueeze(1)
-        x = self.pool(self.bn1(F.relu(self.conv1(x))))
-        x = self.pool(self.bn2(F.relu(self.conv2(x))))
-        return x
+        self.ctx = ctx = candle.GroupPruneContext(stochastic=True)
+        self.conv1 = ctx.wrap(nn.Conv2d(1, 10, kernel_size=5))
+        self.conv2 = ctx.wrap(nn.Conv2d(10, 20, kernel_size=5))
+        self.conv2_drop = nn.Dropout2d()
+        self.fc1 = ctx.wrap(nn.Linear(320, 50))
+        self.fc2 = ctx.bypass(nn.Linear(50, 10))
 
     def forward(self, x):
-        x = self.encode(x)
-        x = x.view(x.size(0), -1)
-        x = self.dropout(F.relu(self.fc1(x)))
-        return self.fc2(x)
+        x = F.relu(F.max_pool2d(self.conv1(x), 2))
+        x = F.relu(F.max_pool2d(self.conv2_drop(self.conv2(x)), 2))
+        x = x.view(-1, 320)
+        x = F.relu(self.fc1(x))
+        x = F.dropout(x, training=self.training)
+        x = self.fc2(x)
+        return F.log_softmax(x, dim=1)
 
-class RecurrentModel(SerializableModule):
-    def __init__(self):
-        super().__init__()
-        self.g_ctx = ctx = candle.GroupPruneContext(stochastic=True)
-        self.rnn = ctx.wrap(nn.GRU(28, 1024, 1, batch_first=True))
-        self.fc2 = ctx.bypass(nn.Linear(1024, 10))
+nets = dict(ptnet=PTNet, lenet=LeNet, lenet5=LeNet5)
+# Training settings
+parser = argparse.ArgumentParser(description='PyTorch MNIST Example')
+parser.add_argument('--batch-size', type=int, default=64, metavar='N',
+                    help='input batch size for training (default: 64)')
+parser.add_argument('--test-batch-size', type=int, default=1000, metavar='N',
+                    help='input batch size for testing (default: 1000)')
+parser.add_argument('--epochs', type=int, default=30, metavar='N',
+                    help='number of epochs to train (default: 10)')
+parser.add_argument('--lr', type=float, default=5E-4, metavar='LR',
+                    help='learning rate (default: 0.01)')
+parser.add_argument('--momentum', type=float, default=0.5, metavar='M',
+                    help='SGD momentum (default: 0.5)')
+parser.add_argument('--no_cuda', action='store_true', default=False,
+                    help='disables CUDA training')
+parser.add_argument('--seed', type=int, default=1, metavar='S',
+                    help='random seed (default: 1)')
+parser.add_argument('--log-interval', type=int, default=50, metavar='N',
+                    help='how many batches to wait before logging training status')
+parser.add_argument('--net', type=str, default='ptnet', choices=list(nets.keys()),
+                    help='what model to use')
+parser.add_argument('--prune', action='store_true', default=False,
+                    help='to prune or not to prune')
+parser.add_argument('--l0-decay', type=float, default=1E-1,
+                    help='the l0 decay to use')
+parser.add_argument('--save', type=str, default='out.pt',
+                    help='save path')
+args, _ = parser.parse_known_args()
+args.cuda = not args.no_cuda and torch.cuda.is_available()
 
-    def forward(self, x):
-        x = x.view(x.size(0), 28, 28)
-        _, out = self.rnn(x)
-        return self.fc2(out.permute(1, 2, 0).contiguous().squeeze(2))
+torch.manual_seed(args.seed)
+if args.cuda:
+    torch.cuda.manual_seed(args.seed)
 
-class TinyModel(SerializableModule):
-    def __init__(self):
-        super().__init__()
-        self.use_cuda = True
-        ctx = candle.Context(candle.read_config())
-        self.conv1 = ctx.binarized(nn.Conv2d(1, 17, 5))
-        self.bn1 = nn.BatchNorm2d(17, affine=False)
-        self.conv2 = ctx.binarized(nn.Conv2d(17, 10, 3))
-        self.bn2 = nn.BatchNorm2d(10, affine=False)
-        self.pool = nn.MaxPool2d(3)
-        self.fc = nn.Linear(40, 10)
 
-    def forward(self, x):
-        x = x.unsqueeze(1)
-        x = self.pool(self.bn1(F.relu(self.conv1(x))))
-        x = self.pool(self.bn2(F.relu(self.conv2(x))))
-        x = x.view(x.size(0), -1)
-        return self.fc(x.view(x.size(0), -1))
-
-def train_pruned(args):
-    model = LeNet()
-    model = RecurrentModel()
-    if args.in_file:
-        model.load(args.in_file)
-    model = model.cuda()
-    ctx = model.g_ctx
-    model.eval()
-    ctx.print_info()
-    model.train()
-    model_params = ctx.list_params()
-    # model_params = ctx.list_model_params()
-    print("Unpruned parameters: {}".format(ctx.count_unpruned()))
-    model_optim = torch.optim.Adam(model_params, lr=5E-4) # incompatible with normal weight decay
-    criterion = nn.CrossEntropyLoss()
-
-    train_set, dev_set, test_set = SingleMnistDataset.splits(args)
-    train_loader = data.DataLoader(train_set, batch_size=128, shuffle=True, drop_last=True)
-    dev_loader = data.DataLoader(dev_set, batch_size=min(32, len(dev_set)))
-    test_loader = data.DataLoader(test_set, batch_size=min(32, len(test_set)))
-
-    best_dev = -0
-    best_state = None
-
-    for n_epoch in range(args.n_epochs):
-        print("Epoch: {}".format(n_epoch + 1))
-        model.train()
-        for i, (model_in, labels) in enumerate(train_loader):
-            model_optim.zero_grad()
-
-            model_in = Variable(model_in.cuda(), requires_grad=False)
-            labels = Variable(labels.cuda(), requires_grad=False)
-
-            scores = model(model_in)
-            loss = criterion(scores, labels) + ctx.l0_loss(1E-1 / 50000) # number of data points
-            loss.backward()
-            model_optim.step()
-
-            # ctx.clip_all_masks()
-            if i % 32 == 0:
-                n_unpruned = ctx.count_unpruned()
-                accuracy = (torch.max(scores, 1)[1].view(model_in.size(0)).data == labels.data).sum() / model_in.size(0)
-                print("train accuracy: {:>10}, loss: {:>25}, unpruned: {}".format(accuracy, loss.data[0], n_unpruned))
-        accuracy = 0
-        n = 0
-        model.eval()
-        for model_in, labels in dev_loader:
-            model_in = Variable(model_in.cuda(), volatile=True)
-            labels = Variable(labels.cuda(), volatile=True)
-            scores = model(model_in)
-            accuracy += (torch.max(scores, 1)[1].view(model_in.size(0)).data == labels.data).sum()
-            n += model_in.size(0)
-        print("dev accuracy: {:>10}".format(accuracy / n))
-        ctx.print_info()
-        torch.save(model.state_dict(), "test.pt")
-        # if trainer.save(-accuracy):
-        #     print("Saving...")
-
-    model.eval()
-    n = 0
-    accuracy = 0
-    for model_in, labels in test_loader:
-        model_in = Variable(model_in.cuda(), volatile=True)
-        labels = Variable(labels.cuda(), volatile=True)
-        scores = model(model_in)
-        accuracy += (torch.max(scores, 1)[1].view(model_in.size(0)).data == labels.data).sum()
-        n += model_in.size(0)
-    print("test accuracy: {:>10}".format(accuracy / n))
-
-def init_model(input_file=None, use_cuda=True):
+kwargs = {'num_workers': 1, 'pin_memory': True} if args.cuda else {}
+train_loader = torch.utils.data.DataLoader(
+    datasets.MNIST('../data', train=True, download=True,
+                   transform=transforms.Compose([
+                       transforms.ToTensor(),
+                       transforms.Normalize((0.1307,), (0.3081,))
+                   ])),
+    batch_size=args.batch_size, shuffle=True, **kwargs)
+test_loader = torch.utils.data.DataLoader(
+    datasets.MNIST('../data', train=False, transform=transforms.Compose([
+                       transforms.ToTensor(),
+                       transforms.Normalize((0.1307,), (0.3081,))
+                   ])),
+    batch_size=args.test_batch_size, shuffle=True, **kwargs)
+net_cls = nets[args.net]
+model = net_cls()
+if args.cuda:
     model.cuda()
+
+if args.prune:
+    params = model.ctx.list_params()
+else:
+    model.ctx.freeze(refresh=False)
+    model.ctx.disable_hooks()
+    params = model.ctx.list_model_params()
+optimizer = optim.Adam(params, lr=args.lr)
+
+def train(epoch):
+    model.train()
+    model.ctx.print_info()
+    for batch_idx, (data, target) in enumerate(train_loader):
+        if args.cuda:
+            data, target = data.cuda(), target.cuda()
+        data, target = Variable(data), Variable(target)
+        optimizer.zero_grad()
+        output = model(data)
+        loss = F.nll_loss(output, target)
+        if args.prune:
+            loss += model.ctx.l0_loss(args.l0_decay / 60000)
+        loss.backward()
+        optimizer.step()
+        if batch_idx % args.log_interval == 0:
+            print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}\tUnpruned params: {}'.format(
+                epoch, batch_idx * len(data), len(train_loader.dataset),
+                100. * batch_idx / len(train_loader), loss.data[0], model.ctx.count_unpruned()))
+
+    if args.prune:
+        model.ctx.freeze()
+    torch.save(model.state_dict(), args.save)
+    if args.prune:
+        model.ctx.unfreeze()
+
+def test():
+    if args.prune:
+        model.ctx.freeze()
     model.eval()
+    test_loss = 0
+    correct = 0
+    model.ctx.print_info()
+    for data, target in test_loader:
+        if args.cuda:
+            data, target = data.cuda(), target.cuda()
+        data, target = Variable(data, volatile=True), Variable(target)
+        output = model(data)
+        test_loss += F.nll_loss(output, target, size_average=False).data[0] # sum up batch loss
+        pred = output.data.max(1, keepdim=True)[1] # get the index of the max log-probability
+        correct += pred.eq(target.data.view_as(pred)).long().cpu().sum()
 
-model = ConvModel()
+    test_loss /= len(test_loader.dataset)
+    print('\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n'.format(
+        test_loss, correct, len(test_loader.dataset),
+        100. * correct / len(test_loader.dataset)))
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--base_in_file", type=str, default="")
-    parser.add_argument("--dir", type=str, default="local_data")
-    parser.add_argument("--in_file", type=str, default="")
-    parser.add_argument("--out_file", type=str, default="output.pt")
-    parser.add_argument("--n_epochs", type=int, default=200)
-    args, _ = parser.parse_known_args()
-    global model
-    init_model(input_file=args.in_file)
-    # train_binary(args)
-    train_pruned(args)
 
-if __name__ == "__main__":
-    main()
+for epoch in range(1, args.epochs + 1):
+    train(epoch)
+    test()

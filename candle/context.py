@@ -128,6 +128,10 @@ class Context(object):
         self.registry.register_proxy("fake", FakeProxy(layer, layer.parameters()))
         return layer
 
+    def disable_hooks(self):
+        for layer in self.layers:
+            layer.disable_hooks()
+
 class MixedContext(object):
     def __init__(self, config, *contexts, **kwargs):
         pass # TODO

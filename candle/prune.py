@@ -59,6 +59,13 @@ class WeightMaskGroup(ProxyDecorator):
     def expand_masks(self):
         raise NotImplementedError
 
+    def apply(self, weights=None):
+        def apply_mask(weight, mask):
+            weight.data.copy_((weight * mask).data)
+        if weights is None:
+            weights = self.root()
+        weights.apply_fn(apply_mask, self.expand_masks())
+
     def build_masks(self, init_value):
         raise NotImplementedError
 
@@ -94,7 +101,8 @@ class WeightMaskGroup(ProxyDecorator):
         if not self.stochastic or self.frozen:
             return
         self.frozen = True
-        self.frozen_samples = self.concrete_fn().clamp(0, 1).detach()
+        if refresh:
+            self.frozen_samples = self.concrete_fn().clamp(0, 1).detach()
 
     def unfreeze(self):
         self.frozen = False
@@ -330,6 +338,11 @@ class GroupPruneContext(PruneContext):
         for mask in group_masks:
             loss = loss + mask.l0_loss(lambd)
         return loss
+
+    def apply(self):
+        group_masks = self.list_proxies("weight_hook", WeightMaskGroup)
+        for mask in group_masks:
+            mask.apply()
 
     def freeze(self, refresh=True):
         group_masks = self.list_proxies("weight_hook", WeightMaskGroup)
