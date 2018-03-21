@@ -177,6 +177,8 @@ def test():
     print('\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n'.format(
         test_loss, correct, len(test_loader.dataset),
         100. * correct / len(test_loader.dataset)))
+    if args.prune:
+        model.ctx.unfreeze()
 
 
 for epoch in range(1, args.epochs + 1):
