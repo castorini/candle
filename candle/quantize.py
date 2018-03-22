@@ -12,17 +12,41 @@ from .estimator import *
 from .nested import *
 from .proxy import *
 
-def linear_quant(x, bits, min=-6, max=6):
-    range = max - min
-    step = range / (2**bits - 1)
-    quantized = hard_round(x / step) * step
-    quantized.data.clamp_(min, max)
-    return quantized
+# Adapted from https://github.com/tensorflow/tensorflow/blob/master/tensorflow/core/kernels/fake_quant_ops_functor.h
+class LinearQuantFunction(ag.Function):
+    @staticmethod
+    def forward(ctx, x, bits, min, max):
+        range = max - min
+        ctx.save_for_backward(x)
+        quant_max = (1 << bits) - 1
+        scale = range / quant_max
+        zero_point = -min / scale
+        if zero_point < 0:
+            nudged_zero_point = 0
+        elif zero_point > quant_max:
+            nudged_zero_point = quant_max
+        else:
+            nudged_zero_point = round(zero_point)
+        
+        nudged_min = -nudged_zero_point * scale
+        nudged_max = (quant_max - nudged_zero_point) * scale
+        ctx.values = nudged_min, nudged_max
+
+        clamped_shifted = x.clamp(nudged_min, nudged_max) - nudged_min
+        quantized = (clamped_shifted / scale + 0.5).floor() * scale + nudged_min
+        return quantized
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, = ctx.saved_variables
+        nudged_min, nudged_max = ctx.values
+        grad_output[(x < nudged_min) | (x > nudged_max)] = 0
+        return grad_output, None, None, None
 
 class QuantizeHook(ProxyDecorator):
-    def __init__(self, layer, child, bits=8):
+    def __init__(self, layer, child, bits=8, min=-6, max=6):
         super().__init__(layer, child)
-        self.bits = bits
+        self.args = (bits, min, max)
 
     @property
     def sizes(self):
@@ -30,8 +54,8 @@ class QuantizeHook(ProxyDecorator):
 
     def call(self, input):
         if isinstance(input, Package):
-            return input.apply_fn(lambda x: linear_quant(x, self.bits))
-        return linear_quant(input, self.bits)
+            return input.apply_fn(lambda x: linear_quant(x, *self.args))
+        return linear_quant(input, *self.args)
 
 class BinaryTanhFunction(ag.Function):
     @staticmethod
@@ -136,6 +160,7 @@ approx_pow2 = ApproxPow2Function.apply
 binary_tanh = BinaryTanhFunction.apply
 hard_divide = HardDivideFunction.apply
 hard_round = HardRoundFunction.apply
+linear_quant = LinearQuantFunction.apply
 
 class BinaryTanh(nn.Module):
     def forward(self, x):
