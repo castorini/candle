@@ -74,7 +74,7 @@ class WeightMaskGroup(ProxyDecorator):
 
     @property
     def n_groups(self):
-        total_params = sum((self.expand_masks() != 0).float().sum().data[0].reify(flat=True))
+        total_params = sum(self.expand_masks().numel().reify(flat=True))
         group_params = sum(self.masks.numel().reify(flat=True))
         return float(total_params / group_params)
 
@@ -168,7 +168,7 @@ class RNNMask(WeightMaskGroup):
         sizes = self.child.sizes.reify()
         self._expand_size = Package([[size[1][0] // size[1][1]] * 4 for size in sizes])
         mask_sizes = [size[1][1] for size in sizes]
-        return self._build_masks(init_value, mask_sizes, randomized_eval=True)
+        return self._build_masks(init_value, mask_sizes, randomized_eval=False)
 
     def expand_masks(self):
         def expand_mask(size, mask, expand_size):

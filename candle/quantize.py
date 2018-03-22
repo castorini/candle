@@ -12,42 +12,28 @@ from .estimator import *
 from .nested import *
 from .proxy import *
 
-class BernoulliHook(ProxyDecorator):
-    def __init__(self, layer, child):
-        super().__init__(layer, child)
-        def normalize_weights(weight):
-            weight.data -= weight.data.mean()
-        self.frozen = False
-        child.package.iter_fn(normalize_weights)
-        self._distribution = SoftBernoulliDistribution(child.package)
+def linear_quant(x, bits):
+    scale = 2**bits
+    quantized = hard_round(x * scale) / scale
+    maxV = 2**(bits - 1) - 1
+    minV = -2**(bits - 1)
+    quantized.data[quantized.data > maxV] = 0
+    quantized.data[quantized.data < minV] = 0
+    return quantized
 
-    def distribution(self):
-        return self._distribution
+class QuantizeHook(ProxyDecorator):
+    def __init__(self, layer, child, bits=8):
+        super().__init__(layer, child)
+        self.bits = bits
 
     @property
     def sizes(self):
         return self.child.sizes
 
-    def freeze(self, x):
-        self.frozen_x = x
-        self.frozen = True
-
-    def unfreeze(self):
-        self.frozen = False
-        self.frozen_x = None
-
     def call(self, input):
-        if self.frozen:
-            return 2 * self.frozen_x - 1
-        return 2 * self.distribution().draw() - 1
-
-class RoundHook(ProxyDecorator):
-    def __init__(self, layer, child):
-        super().__init__(layer, child)
-
-    def call(self, input):
-        return input.apply_fn(lambda x, size: hard_round(x * np.prod(size, dtype=float)), input.size()) \
-            if isinstance(input, Package) else hard_round(input * np.prod(input.size(), dtype=float))
+        if isinstance(input, Package):
+            return input.apply_fn(lambda x: linear_quant(x, self.bits))
+        return linear_quant(input, self.bits)
 
 class BinaryTanhFunction(ag.Function):
     @staticmethod
@@ -157,13 +143,13 @@ class BinaryTanh(nn.Module):
     def forward(self, x):
         return binary_tanh(x)
 
-class BinaryContext(Context):
+class QuantizeContext(Context):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
     def compose(self, layer, **kwargs):
         layer = super().compose(layer, **kwargs)
-        hook = layer.hook_weight(RoundHook)
-        if kwargs.get("round", True):
-            layer.hook_output(RoundHook)
+        hook = layer.hook_weight(QuantizeHook)
+        if kwargs.get("output", True):
+            layer.hook_output(QuantizeHook)
         return layer

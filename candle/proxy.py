@@ -52,7 +52,8 @@ class ProxyDecorator(Proxy):
         return self.child.root
 
     def print_info(self):
-        self.child.print_info()
+        if self.child is not None:
+            self.child.print_info()
 
     def call(self, package, **kwargs):
         raise NotImplementedError
@@ -125,10 +126,8 @@ class ProxyLayer(nn.Module):
 
     def disable_hooks(self):
         self.weight_provider = self.weight_provider.root
-        if self.output_proxy is not None:
-            self.output_proxy = self.output_proxy.root
-        if self.input_proxy is not None:
-            self.input_proxy = self.input_proxy.root
+        self.output_proxy = None
+        self.input_proxy = None
 
     def find_provider(self, provider_type):
         return self._find_provider(provider_type, self.weight_provider)
