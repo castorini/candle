@@ -14,7 +14,7 @@ from .proxy import *
 
 def linear_quant(x, bits, min=-6, max=6):
     range = max - min
-    step = range / 2**bits
+    step = range / (2**bits - 1)
     quantized = hard_round(x / step) * step
     quantized.data.clamp_(min, max)
     return quantized
