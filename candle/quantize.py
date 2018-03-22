@@ -12,13 +12,11 @@ from .estimator import *
 from .nested import *
 from .proxy import *
 
-def linear_quant(x, bits):
-    scale = 2**bits
-    quantized = hard_round(x * scale) / scale
-    maxV = 2**(bits - 1) - 1
-    minV = -2**(bits - 1)
-    quantized.data[quantized.data > maxV] = 0
-    quantized.data[quantized.data < minV] = 0
+def linear_quant(x, bits, min=-6, max=6):
+    range = max - min
+    step = range / 2**bits
+    quantized = hard_round(x / step) * step
+    quantized.data.clamp_(min, max)
     return quantized
 
 class QuantizeHook(ProxyDecorator):
