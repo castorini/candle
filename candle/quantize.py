@@ -43,8 +43,75 @@ class LinearQuantFunction(ag.Function):
         grad_output[(x < nudged_min) | (x > nudged_max)] = 0
         return grad_output, None, None, None
 
+class RestrictGradientFunction(ag.Function):
+    @staticmethod
+    def forward(ctx, x, restrict_fn):
+        ctx.mask_fn = restrict_fn
+        return x
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        grad_output[ctx.mask_fn(grad_output)] = 0
+        return grad_output, None
+
+class SoftSignFunction(ag.Function):
+    @staticmethod
+    def forward(ctx, x, scale=None, use_tanh=False):
+        if use_tanh:
+            ctx.save_for_backward(x, scale)
+        else:
+            ctx.save_for_backward(x)
+        ctx.use_tanh = use_tanh
+        return 2 * x.clamp(0, 1).ceil() - 1
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        if ctx.use_tanh:
+            x, scale = ctx.saved_variables
+            grad_out = grad_output * (1 - (scale * x).tanh()**2) * scale
+        else:
+            grad_out = grad_output
+        return grad_output, None, None
+
+def dynamic_tanh(x, t, max_scale=30):
+    x = (t <= max_scale).float() * F.tanh(t * x) + (t > max_scale).float() * soft_sign(x, t, True)
+    return x
+
+class BinarizeHook(ProxyDecorator):
+    def __init__(self, layer, child, t=0.5, out_shape=None, soft=True, clamp=(-1, 1)):
+        super().__init__(layer, child)
+        out_shape = Package(out_shape) if out_shape else self.sizes
+        self.soft = soft
+        self.clamp = clamp
+        if soft:
+            if isinstance(t, nn.Parameter):
+                self.scales = out_shape.apply_fn(lambda _: t)
+                self._flattened_params = [t]
+            else:
+                self.scales = out_shape.apply_fn(lambda _: nn.Parameter(torch.Tensor([t])))
+                self._flattened_params = self.scales.reify(flat=True)
+
+    def parameters(self):
+        if self.soft:
+            return self._flattened_params
+        return []
+
+    @property
+    def sizes(self):
+        return self.child.sizes
+
+    def call(self, input):
+        if self.clamp:
+            input.data.clamp_(*self.clamp)
+        if self.soft:
+            scales = self.scales.apply_fn(lambda x: restrict_grad(x, lambda y: y > 0))
+            input = input.apply_fn(dynamic_tanh, scales)
+        else:
+            input = input.apply_fn(soft_sign)
+        return input
+
 class QuantizeHook(ProxyDecorator):
-    def __init__(self, layer, child, bits=8, min=-6, max=6):
+    def __init__(self, layer, child, bits=8, min=-3, max=3):
         super().__init__(layer, child)
         self.args = (bits, min, max)
 
@@ -53,9 +120,8 @@ class QuantizeHook(ProxyDecorator):
         return self.child.sizes
 
     def call(self, input):
-        if isinstance(input, Package):
-            return input.apply_fn(lambda x: linear_quant(x, *self.args))
-        return linear_quant(input, *self.args)
+        input = input.apply_fn(lambda x: linear_quant(x, *self.args))
+        return input
 
 class BinaryTanhFunction(ag.Function):
     @staticmethod
@@ -161,6 +227,8 @@ binary_tanh = BinaryTanhFunction.apply
 hard_divide = HardDivideFunction.apply
 hard_round = HardRoundFunction.apply
 linear_quant = LinearQuantFunction.apply
+restrict_grad = RestrictGradientFunction.apply
+soft_sign = SoftSignFunction.apply
 
 class BinaryTanh(nn.Module):
     def forward(self, x):
@@ -175,4 +243,28 @@ class QuantizeContext(Context):
         hook = layer.hook_weight(QuantizeHook)
         if kwargs.get("output", True):
             layer.hook_output(QuantizeHook)
+        return layer
+
+class BinarizeContext(Context):
+    def __init__(self, soft=True, **kwargs):
+        super().__init__(**kwargs)
+        self.soft = soft
+
+    def list_scale_params(self, inverse=False):
+        if inverse:
+            return super().list_params(lambda proxy: not isinstance(proxy, BinarizeHook))
+        return super().list_params(lambda proxy: isinstance(proxy, BinarizeHook))
+
+    def list_model_params(self):
+        return self.list_scale_params(True)
+
+    def quantize_loss(self, lambd):
+        loss = 0
+        for param in self.list_model_params():
+            loss = loss + lambd / (param.norm(p=0.66) + 1E-8)
+        return loss
+
+    def compose(self, layer, soft=True, clamp=(-1, 1), scale=0.5, **kwargs):
+        layer = super().compose(layer, **kwargs)
+        hook = layer.hook_weight(BinarizeHook, soft=soft, clamp=clamp, t=scale)
         return layer

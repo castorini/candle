@@ -125,7 +125,7 @@ class HardConcreteFunction(Function):
     Louizos et al. (2018)
     """
 
-    def __init__(self, context, alpha, beta, gamma=-0.1, zeta=1.1, randomized_eval=False):
+    def __init__(self, context, alpha, beta, gamma=-0.1, zeta=1.1, randomized_eval=False, optimize_beta=False):
         self.alpha = alpha
         self.beta = beta
         self.gamma = gamma
@@ -133,6 +133,7 @@ class HardConcreteFunction(Function):
         self.sizes = alpha.size()
         self.context = context
         self.randomized_eval = randomized_eval
+        self.optimize_beta = optimize_beta
 
     def __call__(self):
         self.beta.data.clamp_(1E-8, 1E8)
@@ -149,7 +150,9 @@ class HardConcreteFunction(Function):
         return (self.alpha.log() - self.beta * np.log(-self.gamma / self.zeta)).sigmoid()
 
     def parameters(self):
-        return Package([self.alpha, self.beta])
+        if self.optimize_beta:
+            return Package([self.alpha, self.beta])
+        return Package([self.alpha])
 
     @classmethod
     def build(cls, context, sizes, **kwargs):

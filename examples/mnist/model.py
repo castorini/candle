@@ -13,13 +13,13 @@ import candle
 class LeNet(nn.Module):
     def __init__(self):
         super().__init__()
-        self.ctx = ctx = candle.GroupPruneContext(stochastic=True)
+        self.ctx = ctx = candle.BinarizeContext()
         self.net = nn.Sequential(
-            ctx.wrap(nn.Linear(784, 300), prune="in"),
-            nn.Tanh(),
-            ctx.wrap(nn.Linear(300, 100), prune="in"),
-            nn.Tanh(),
-            ctx.wrap(nn.Linear(100, 10), prune="in"))
+            ctx.wrap(nn.Linear(784, 288), soft=False, clamp=(-1, 1)),
+            nn.ReLU(),
+            ctx.wrap(nn.Linear(288, 100), soft=False, clamp=(-1, 1)),
+            nn.ReLU(),
+            ctx.wrap(nn.Linear(100, 10), soft=False, clamp=(-1, 1)))
 
     def forward(self, x):
         x = x.view(x.size(0), -1)
@@ -54,18 +54,22 @@ class LeNet5(nn.Module): # broken right now
 class PTNet(nn.Module):
     def __init__(self):
         super().__init__()
-        self.ctx = ctx = candle.GroupPruneContext(stochastic=True)
-        self.conv1 = ctx.wrap(nn.Conv2d(1, 10, kernel_size=5))
-        self.conv2 = ctx.wrap(nn.Conv2d(10, 20, kernel_size=5))
+        self.ctx = ctx = candle.BinarizeContext()
+        self.scale = scale = nn.Parameter(torch.Tensor([0.5]))
+        self.conv1 = ctx.wrap(nn.Conv2d(1, 10, kernel_size=5), scale=scale, soft=not args.ste)#, soft=False, clamp=(-1, 1))
+        self.bn_c1 = nn.BatchNorm2d(10)
+        self.conv2 = ctx.wrap(nn.Conv2d(10, 20, kernel_size=5), scale=scale, soft=not args.ste)#, soft=False, clamp=(-1, 1))
+        self.bn_c2 = nn.BatchNorm2d(20)
         self.conv2_drop = nn.Dropout2d()
-        self.fc1 = ctx.wrap(nn.Linear(320, 50))
-        self.fc2 = ctx.bypass(nn.Linear(50, 10))
+        self.fc1 = ctx.wrap(nn.Linear(320, 50), scale=scale, soft=not args.ste)#, soft=False, clamp=(-1, 1))
+        self.bn_fc1 = nn.BatchNorm1d(50)
+        self.fc2 = ctx.wrap(nn.Linear(50, 10), scale=scale, soft=not args.ste)#, soft=False, clamp=(-1, 1))
 
     def forward(self, x):
-        x = F.relu(F.max_pool2d(self.conv1(x), 2))
-        x = F.relu(F.max_pool2d(self.conv2_drop(self.conv2(x)), 2))
+        x = F.relu(F.max_pool2d(self.bn_c1(self.conv1(x)), 2))
+        x = F.relu(F.max_pool2d(self.conv2_drop(self.bn_c2(self.conv2(x))), 2))
         x = x.view(-1, 320)
-        x = F.relu(self.fc1(x))
+        x = self.bn_fc1(F.relu(self.fc1(x)))
         x = F.dropout(x, training=self.training)
         x = self.fc2(x)
         return F.log_softmax(x, dim=1)
@@ -77,7 +81,7 @@ parser.add_argument('--batch-size', type=int, default=64, metavar='N',
                     help='input batch size for training (default: 64)')
 parser.add_argument('--test-batch-size', type=int, default=1000, metavar='N',
                     help='input batch size for testing (default: 1000)')
-parser.add_argument('--epochs', type=int, default=30, metavar='N',
+parser.add_argument('--epochs', type=int, default=120, metavar='N',
                     help='number of epochs to train (default: 10)')
 parser.add_argument('--lr', type=float, default=5E-4, metavar='LR',
                     help='learning rate (default: 0.01)')
@@ -97,8 +101,11 @@ parser.add_argument('--l0-decay', type=float, default=1E-1,
                     help='the l0 decay to use')
 parser.add_argument('--save', type=str, default='out.pt',
                     help='save path')
+parser.add_argument('--restore', action='store_true', default=False)
+parser.add_argument('--ste', action='store_true', default=False,
+                    help='Use straight-through estimator')
 args, _ = parser.parse_known_args()
-args.cuda = not args.no_cuda and torch.cuda.is_available()
+args.cuda = not args.no_cuda and torch.cuda.is_available()  
 
 torch.manual_seed(args.seed)
 if args.cuda:
@@ -124,13 +131,10 @@ model = net_cls()
 if args.cuda:
     model.cuda()
 
-if args.prune:
-    params = model.ctx.list_params()
-else:
-    model.ctx.freeze(refresh=False)
-    model.ctx.disable_hooks()
-    params = model.ctx.list_model_params()
+params = model.ctx.list_params()
 optimizer = optim.Adam(params, lr=args.lr)
+if args.restore:
+    model.load_state_dict(torch.load(args.save), strict=False)
 
 def train(epoch):
     model.train()
@@ -141,25 +145,17 @@ def train(epoch):
         data, target = Variable(data), Variable(target)
         optimizer.zero_grad()
         output = model(data)
-        loss = F.nll_loss(output, target)
-        if args.prune:
-            loss += model.ctx.l0_loss(args.l0_decay / 60000)
+        loss = F.nll_loss(output, target) # Optionally add quantize_loss here (doesn't do much)
         loss.backward()
         optimizer.step()
         if batch_idx % args.log_interval == 0:
-            print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}\tUnpruned params: {}'.format(
+            print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}\tScale: {}'.format(
                 epoch, batch_idx * len(data), len(train_loader.dataset),
-                100. * batch_idx / len(train_loader), loss.data[0], model.ctx.count_unpruned()))
+                100. * batch_idx / len(train_loader), loss.data[0], model.scale.data[0]))
 
-    if args.prune:
-        model.ctx.freeze()
     torch.save(model.state_dict(), args.save)
-    if args.prune:
-        model.ctx.unfreeze()
 
 def test():
-    if args.prune:
-        model.ctx.freeze()
     model.eval()
     test_loss = 0
     correct = 0
@@ -177,8 +173,6 @@ def test():
     print('\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n'.format(
         test_loss, correct, len(test_loader.dataset),
         100. * correct / len(test_loader.dataset)))
-    if args.prune:
-        model.ctx.unfreeze()
 
 
 for epoch in range(1, args.epochs + 1):

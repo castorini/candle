@@ -147,22 +147,20 @@ class ProxyLayer(nn.Module):
         self._register_all_params("input_hook", self.input_proxy)
         return self.input_proxy
 
-    def apply_input_hook(self, *args):
+    def apply_input_hook(self, args):
         if self.input_proxy is None:
             return args
-        return self.input_proxy(*args)
+        return self.input_proxy(Package([list(args)])).singleton()
 
     def apply_output_hook(self, out):
         if self.output_proxy is None:
             return out
-        return self.output_proxy(out)
+        return self.output_proxy(Package([out])).singleton()
 
     def forward(self, *args, **kwargs):
-        if self.input_proxy is not None:
-            args = self.input_proxy(*args)
+        args = self.apply_input_hook(args)
         out = self.on_forward(*args, **kwargs)
-        if self.output_proxy is not None:
-            out = self.output_proxy(out)
+        out = self.apply_output_hook(out)
         return out
 
     def on_forward(self, *args, **kwargs):
