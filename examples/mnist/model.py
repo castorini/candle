@@ -16,13 +16,15 @@ class LeNet(nn.Module):
         self.ctx = ctx = candle.StepQuantizeContext()
         self.scale = scale = nn.Parameter(torch.Tensor([0.5]))
         self.net = nn.Sequential(
-            ctx.wrap(nn.Linear(784, 288), scale=scale, soft=not args.ste),
-            nn.BatchNorm1d(288),
+            ctx.wrap(nn.Linear(784, 1024), scale=scale, soft=not args.ste),
+            nn.BatchNorm1d(1024),
             nn.ReLU(),
-            ctx.wrap(nn.Linear(288, 100), scale=scale, soft=not args.ste),
-            nn.BatchNorm1d(100),
+            nn.Dropout(0.4),
+            ctx.wrap(nn.Linear(1024, 512), scale=scale, soft=not args.ste),
+            nn.BatchNorm1d(512),
             nn.ReLU(),
-            ctx.wrap(nn.Linear(100, 10), scale=scale, soft=not args.ste))
+            nn.Dropout(0.4),
+            ctx.wrap(nn.Linear(512, 10), scale=scale, soft=not args.ste))
 
     def forward(self, x):
         x = x.view(x.size(0), -1)

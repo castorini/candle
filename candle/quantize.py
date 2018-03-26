@@ -45,14 +45,17 @@ class LinearQuantFunction(ag.Function):
 
 class RestrictGradientFunction(ag.Function):
     @staticmethod
-    def forward(ctx, x, restrict_fn):
+    def forward(ctx, x, restrict_fn, apply_fn=None):
         ctx.mask_fn = restrict_fn
+        ctx.apply_fn = apply_fn
         return x
 
     @staticmethod
     def backward(ctx, grad_output):
         grad_output[ctx.mask_fn(grad_output)] = 0
-        return grad_output, None
+        if ctx.apply_fn:
+            ctx.apply_fn(grad_output)
+        return grad_output, None, None
 
 def sech2(x):
     return 1 - x.tanh()**2
@@ -83,7 +86,7 @@ class MultiStepFunction(ag.Function):
             grad_out = grad_output
         return grad_out, None, None, None, None
 
-def dynamic_tanh(x, t, max_scale=15, n_steps=1, limit=1):
+def dynamic_tanh(x, t, max_scale=50, n_steps=1, limit=1):
     x = (t <= max_scale).float() * F.tanh(t * x) + (t > max_scale).float() * multi_step(x, t, n_steps, limit, True)
     return x
 
