@@ -1,6 +1,7 @@
 import enum
 
 from torch.autograd import Variable
+from scipy.optimize import fsolve
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -37,3 +38,11 @@ class RNNWeightDrop(ProxyDecorator):
             apply_dropout(x)
         return Package.reshape_into(input.nested_shape, flatten(weights))
 
+def solve_log_cosh(scale=1, limit=1):
+    def loss(x):
+        a, b = x
+        f1 = a * np.log(np.cosh(b * limit)) - scale * limit**2
+        f2 = a * np.log(np.cosh(b * limit / 2)) - scale * limit**2 / 4
+        return f1, f2
+    a, b = fsolve(loss, (scale * limit * 10, scale * limit / 10), maxfev=5000)
+    return a, b

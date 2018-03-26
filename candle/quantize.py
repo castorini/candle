@@ -54,39 +54,54 @@ class RestrictGradientFunction(ag.Function):
         grad_output[ctx.mask_fn(grad_output)] = 0
         return grad_output, None
 
-class SoftSignFunction(ag.Function):
+def sech2(x):
+    return 1 - x.tanh()**2
+
+class MultiStepFunction(ag.Function):
     @staticmethod
-    def forward(ctx, x, scale=None, use_tanh=False):
+    def forward(ctx, x, scale=None, n_steps=1, limit=1, use_tanh=False):
         if use_tanh:
             ctx.save_for_backward(x, scale)
         else:
             ctx.save_for_backward(x)
-        ctx.use_tanh = use_tanh
-        return 2 * x.clamp(0, 1).ceil() - 1
+        ctx.other_vars = n_steps, limit, use_tanh
+        if n_steps % 2 == 0:
+            return limit * ((x * (n_steps + 1) / (2 * limit)).round() * 2 / n_steps)
+        else:
+            return 2 * x.clamp(0, 1).ceil() - 1 # TODO: Support multistep for odd steps...
 
     @staticmethod
     def backward(ctx, grad_output):
-        if ctx.use_tanh:
+        n_steps, limit, use_tanh = ctx.other_vars
+        if use_tanh:
             x, scale = ctx.saved_variables
-            grad_out = grad_output * (1 - (scale * x).tanh()**2) * scale
+            grad_out = 0
+            for idx in range(1, n_steps + 1):
+                grad_out = grad_out + sech2(scale * (x + (limit - 2 * limit * idx / (n_steps + 1))))
+            grad_out = scale * grad_out * grad_output
         else:
             grad_out = grad_output
-        return grad_output, None, None
+        return grad_out, None, None, None, None
 
-def dynamic_tanh(x, t, max_scale=30):
-    x = (t <= max_scale).float() * F.tanh(t * x) + (t > max_scale).float() * soft_sign(x, t, True)
+def dynamic_tanh(x, t, max_scale=15, n_steps=1, limit=1):
+    x = (t <= max_scale).float() * F.tanh(t * x) + (t > max_scale).float() * multi_step(x, t, n_steps, limit, True)
     return x
 
-class BinarizeHook(ProxyDecorator):
-    def __init__(self, layer, child, t=0.5, out_shape=None, soft=True, clamp=(-1, 1)):
+def soft_sign(x):
+    return multi_step(x)
+
+class StepQuantizeHook(ProxyDecorator):
+    def __init__(self, layer, child, t=0.5, out_shape=None, soft=True, limit=1, n_steps=1, adaptive=True):
         super().__init__(layer, child)
         out_shape = Package(out_shape) if out_shape else self.sizes
         self.soft = soft
-        self.clamp = clamp
+        self.limit = limit
+        self.clamp = (-limit, limit)
+        self.n_steps = n_steps
         if soft:
             if isinstance(t, nn.Parameter):
                 self.scales = out_shape.apply_fn(lambda _: t)
-                self._flattened_params = [t]
+                self._flattened_params = [t] if adaptive else []
             else:
                 self.scales = out_shape.apply_fn(lambda _: nn.Parameter(torch.Tensor([t])))
                 self._flattened_params = self.scales.reify(flat=True)
@@ -105,7 +120,7 @@ class BinarizeHook(ProxyDecorator):
             input.data.clamp_(*self.clamp)
         if self.soft:
             scales = self.scales.apply_fn(lambda x: restrict_grad(x, lambda y: y > 0))
-            input = input.apply_fn(dynamic_tanh, scales)
+            input = input.apply_fn(lambda x, t: dynamic_tanh(x, t, n_steps=self.n_steps, limit=self.limit), scales)
         else:
             input = input.apply_fn(soft_sign)
         return input
@@ -228,7 +243,7 @@ hard_divide = HardDivideFunction.apply
 hard_round = HardRoundFunction.apply
 linear_quant = LinearQuantFunction.apply
 restrict_grad = RestrictGradientFunction.apply
-soft_sign = SoftSignFunction.apply
+multi_step = MultiStepFunction.apply
 
 class BinaryTanh(nn.Module):
     def forward(self, x):
@@ -245,15 +260,15 @@ class QuantizeContext(Context):
             layer.hook_output(QuantizeHook)
         return layer
 
-class BinarizeContext(Context):
+class StepQuantizeContext(Context):
     def __init__(self, soft=True, **kwargs):
         super().__init__(**kwargs)
         self.soft = soft
 
     def list_scale_params(self, inverse=False):
         if inverse:
-            return super().list_params(lambda proxy: not isinstance(proxy, BinarizeHook))
-        return super().list_params(lambda proxy: isinstance(proxy, BinarizeHook))
+            return super().list_params(lambda proxy: not isinstance(proxy, StepQuantizeHook))
+        return super().list_params(lambda proxy: isinstance(proxy, StepQuantizeHook))
 
     def list_model_params(self):
         return self.list_scale_params(True)
@@ -264,7 +279,7 @@ class BinarizeContext(Context):
             loss = loss + lambd / (param.norm(p=0.66) + 1E-8)
         return loss
 
-    def compose(self, layer, soft=True, clamp=(-1, 1), scale=0.5, **kwargs):
+    def compose(self, layer, soft=True, limit=1, scale=0.5, adaptive=True, n_steps=1, **kwargs):
         layer = super().compose(layer, **kwargs)
-        hook = layer.hook_weight(BinarizeHook, soft=soft, clamp=clamp, t=scale)
+        hook = layer.hook_weight(StepQuantizeHook, soft=soft, limit=limit, t=scale, n_steps=n_steps, adaptive=adaptive)
         return layer

@@ -13,13 +13,16 @@ import candle
 class LeNet(nn.Module):
     def __init__(self):
         super().__init__()
-        self.ctx = ctx = candle.BinarizeContext()
+        self.ctx = ctx = candle.StepQuantizeContext()
+        self.scale = scale = nn.Parameter(torch.Tensor([0.5]))
         self.net = nn.Sequential(
-            ctx.wrap(nn.Linear(784, 288), soft=False, clamp=(-1, 1)),
+            ctx.wrap(nn.Linear(784, 288), scale=scale, soft=not args.ste),
+            nn.BatchNorm1d(288),
             nn.ReLU(),
-            ctx.wrap(nn.Linear(288, 100), soft=False, clamp=(-1, 1)),
+            ctx.wrap(nn.Linear(288, 100), scale=scale, soft=not args.ste),
+            nn.BatchNorm1d(100),
             nn.ReLU(),
-            ctx.wrap(nn.Linear(100, 10), soft=False, clamp=(-1, 1)))
+            ctx.wrap(nn.Linear(100, 10), scale=scale, soft=not args.ste))
 
     def forward(self, x):
         x = x.view(x.size(0), -1)
@@ -54,16 +57,16 @@ class LeNet5(nn.Module): # broken right now
 class PTNet(nn.Module):
     def __init__(self):
         super().__init__()
-        self.ctx = ctx = candle.BinarizeContext()
+        self.ctx = ctx = candle.StepQuantizeContext()
         self.scale = scale = nn.Parameter(torch.Tensor([0.5]))
-        self.conv1 = ctx.wrap(nn.Conv2d(1, 10, kernel_size=5), scale=scale, soft=not args.ste)#, soft=False, clamp=(-1, 1))
+        self.conv1 = ctx.wrap(nn.Conv2d(1, 10, kernel_size=5), scale=scale, soft=not args.ste)
         self.bn_c1 = nn.BatchNorm2d(10)
-        self.conv2 = ctx.wrap(nn.Conv2d(10, 20, kernel_size=5), scale=scale, soft=not args.ste)#, soft=False, clamp=(-1, 1))
+        self.conv2 = ctx.wrap(nn.Conv2d(10, 20, kernel_size=5), scale=scale, soft=not args.ste)
         self.bn_c2 = nn.BatchNorm2d(20)
         self.conv2_drop = nn.Dropout2d()
-        self.fc1 = ctx.wrap(nn.Linear(320, 50), scale=scale, soft=not args.ste)#, soft=False, clamp=(-1, 1))
+        self.fc1 = ctx.wrap(nn.Linear(320, 50), scale=scale, soft=not args.ste)
         self.bn_fc1 = nn.BatchNorm1d(50)
-        self.fc2 = ctx.wrap(nn.Linear(50, 10), scale=scale, soft=not args.ste)#, soft=False, clamp=(-1, 1))
+        self.fc2 = ctx.wrap(nn.Linear(50, 10), scale=scale, soft=not args.ste)
 
     def forward(self, x):
         x = F.relu(F.max_pool2d(self.bn_c1(self.conv1(x)), 2))
