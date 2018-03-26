@@ -56,6 +56,7 @@ class Context(object):
         self._cfg_kwargs.update(kwargs)
         self.registry = ProxyRegistry()
         self.layers = []
+        self.opt_params = []
         self.cache = Memoizer()
 
     def build_provider(self, layer):
@@ -68,15 +69,22 @@ class Context(object):
     def list_providers(self):
         return self.list_proxies("weight_provider")
 
+    def add_parameter(self, parameter):
+        self.opt_params.append(parameter)
+
     def print_info(self):
         for proxy in self.list_proxies():
             proxy.print_info()
 
-    def list_params(self, filter_fn=None):
+    def list_params(self, filter_fn=None, include_opt=True):
         all_proxies = self.list_proxies()
         if filter_fn is None:
-            return list(itertools.chain.from_iterable(p.parameters() for p in all_proxies))
-        return list(itertools.chain.from_iterable(p.parameters() for p in filter(filter_fn, all_proxies)))
+            lst = list(itertools.chain.from_iterable(p.parameters() for p in all_proxies))
+        else:
+            lst = list(itertools.chain.from_iterable(p.parameters() for p in filter(filter_fn, all_proxies)))
+        if include_opt:
+            lst.extend(self.opt_params)
+        return lst
 
     def list_buffers(self, filter_fn=None):
         all_proxies = self.list_proxies()

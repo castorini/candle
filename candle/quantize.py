@@ -86,21 +86,70 @@ class MultiStepFunction(ag.Function):
             grad_out = grad_output
         return grad_out, None, None, None, None
 
+class SigmoidStepFunction(ag.Function):
+    @staticmethod
+    def forward(ctx, x, scale=None, use_sigmoid=False):
+        if use_sigmoid:
+            ctx.save_for_backward(x, scale)
+        else:
+            ctx.save_for_backward(x)
+        ctx.use_sigmoid = use_sigmoid
+        return x.clamp(0, 1).ceil()
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        if ctx.use_sigmoid:
+            x, scale = ctx.saved_variables
+            s = (scale * x).sigmoid()
+            grad_out = s * (1 - s)
+            grad_out = scale * grad_out * grad_output
+        else:
+            grad_out = grad_output
+        return grad_out
+
 def dynamic_tanh(x, t, max_scale=50, n_steps=1, limit=1):
     x = (t <= max_scale).float() * F.tanh(t * x) + (t > max_scale).float() * multi_step(x, t, n_steps, limit, True)
     return x
 
-def soft_sign(x):
-    return multi_step(x)
+def dynamic_sigmoid(x, t, max_scale=50, n_steps=1, limit=1):
+    # TODO Support multistep
+    x = (t <= max_scale).float() * F.sigmoid(t * x) + (t > max_scale).float() * sigmoid_step(x, t, True)
+
+class BinaryActivation(nn.Module):
+    def __init__(self, type="tanh", t=0.5, soft=True, limit=None):
+        super().__init__()
+        self.soft = soft
+        self.use_sigmoid = type == "sigmoid"
+        self.limit = limit
+        if soft:
+            self.fn = dynamic_tanh if type == "tanh" else dynamic_sigmoid
+            if isinstance(t, nn.Parameter):
+                self.scale = t
+            else:
+                self.scale = nn.Parameter(torch.Tensor([t]))
+        else:
+            self.fn = soft_sign
+
+    def forward(self, x):
+        if self.limit:
+            x = restrict_grad(x, lambda x: (x < -self.limit) | (x > self.limit))
+        if self.soft:
+            return self.fn(x, self.scale)
+        else:
+            return self.fn(x, use_sigmoid=self.use_sigmoid)
+
+def soft_sign(x, use_sigmoid=False):
+    return sigmoid_step(x) if use_sigmoid else multi_step(x)
 
 class StepQuantizeHook(ProxyDecorator):
-    def __init__(self, layer, child, t=0.5, out_shape=None, soft=True, limit=1, n_steps=1, adaptive=True):
+    def __init__(self, layer, child, t=0.5, out_shape=None, soft=True, limit=1, n_steps=1, adaptive=True, out="tanh"):
         super().__init__(layer, child)
         out_shape = Package(out_shape) if out_shape else self.sizes
         self.soft = soft
         self.limit = limit
         self.clamp = (-limit, limit)
         self.n_steps = n_steps
+        self.use_sigmoid = out == "sigmoid"
         if soft:
             if isinstance(t, nn.Parameter):
                 self.scales = out_shape.apply_fn(lambda _: t)
@@ -123,9 +172,12 @@ class StepQuantizeHook(ProxyDecorator):
             input.data.clamp_(*self.clamp)
         if self.soft:
             scales = self.scales.apply_fn(lambda x: restrict_grad(x, lambda y: y > 0))
-            input = input.apply_fn(lambda x, t: dynamic_tanh(x, t, n_steps=self.n_steps, limit=self.limit), scales)
+            if self.use_sigmoid:
+                input = input.apply_fn(lambda x, t: dynamic_sigmoid(x, t), scales)
+            else:
+                input = input.apply_fn(lambda x, t: dynamic_tanh(x, t, n_steps=self.n_steps, limit=self.limit), scales)
         else:
-            input = input.apply_fn(soft_sign)
+            input = input.apply_fn(lambda x: soft_sign(x, use_sigmoid=self.use_sigmoid))
         return input
 
 class QuantizeHook(ProxyDecorator):
@@ -247,6 +299,7 @@ hard_round = HardRoundFunction.apply
 linear_quant = LinearQuantFunction.apply
 restrict_grad = RestrictGradientFunction.apply
 multi_step = MultiStepFunction.apply
+sigmoid_step = SigmoidStepFunction.apply
 
 class BinaryTanh(nn.Module):
     def forward(self, x):
@@ -282,7 +335,11 @@ class StepQuantizeContext(Context):
             loss = loss + lambd / (param.norm(p=0.66) + 1E-8)
         return loss
 
-    def compose(self, layer, soft=True, limit=1, scale=0.5, adaptive=True, n_steps=1, **kwargs):
+    def activation(self, type="tanh", scale=0.5, soft=True, limit=1):
+        return self.bypass(BinaryActivation(type, scale, soft, limit=limit))
+
+    def compose(self, layer, soft=True, limit=1, scale=0.5, adaptive=True, n_steps=1, out="tanh", **kwargs):
         layer = super().compose(layer, **kwargs)
-        hook = layer.hook_weight(StepQuantizeHook, soft=soft, limit=limit, t=scale, n_steps=n_steps, adaptive=adaptive)
+        hook = layer.hook_weight(StepQuantizeHook, soft=soft, limit=limit, t=scale, n_steps=n_steps, 
+            adaptive=adaptive, out=out)
         return layer
