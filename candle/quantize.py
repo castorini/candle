@@ -145,7 +145,7 @@ class LeakyTanhFunction(ag.Function):
 def dynamic_relu(x, t, max_scale=50, alpha=1E-2):
     return relu_step(x, alpha)
 
-def dynamic_tanh(x, t, max_scale=50, alpha=5E-1):
+def dynamic_tanh(x, t, max_scale=50, alpha=1E-2):
     if t.data[0] <= max_scale:
         x = leaky_tanh(t * x, alpha)
     else:
