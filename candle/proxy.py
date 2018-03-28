@@ -69,9 +69,13 @@ class FakeProxy(Proxy):
     def __init__(self, layer, parameters):
         super().__init__(layer)
         self.params = list(parameters)
+        self.buffers = layer._buffers
 
     def parameters(self):
         return self.params
+
+    def buffers(self):
+        return self.buffers
 
     @property
     def sizes(self):
@@ -150,12 +154,12 @@ class ProxyLayer(nn.Module):
     def apply_input_hook(self, args):
         if self.input_proxy is None:
             return args
-        return self.input_proxy(Package([list(args)])).singleton()
+        return self.input_proxy(Package([list(args)])).reify()[0]
 
     def apply_output_hook(self, out):
         if self.output_proxy is None:
             return out
-        return self.output_proxy(Package([out])).singleton()
+        return self.output_proxy(Package([out])).reify()[0]
 
     def forward(self, *args, **kwargs):
         args = self.apply_input_hook(args)

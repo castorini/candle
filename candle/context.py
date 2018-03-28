@@ -4,6 +4,7 @@ import itertools
 import torch
 import torch.nn as nn
 
+from .debug import *
 from .proxy import *
 
 def read_cli_config():
@@ -131,6 +132,10 @@ class Context(object):
         wrapped_layer = self.compose(layer, **cfg)
         self.layers.append(wrapped_layer) # TODO: insert per-layer hyperparams (mask decay, etc) here if needed
         return wrapped_layer
+
+    def debug(self, layer, hook_types, type, **kwargs):
+        debug_layer(layer, hook_types, type, **kwargs)
+        return layer
 
     def bypass(self, layer):
         self.registry.register_proxy("fake", FakeProxy(layer, layer.parameters()))

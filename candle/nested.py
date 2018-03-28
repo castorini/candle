@@ -1,12 +1,3 @@
-def debug_print(name=""):
-    def arg_wrap(function):
-        def print_wrap(*args, **kwargs):
-            x = function(*args, **kwargs)
-            print(f"{name}", x.reify() if isinstance(x, Package) else x)
-            return x
-        return print_wrap
-    return arg_wrap
-
 def apply_gradient(x, grad):
     x.grad = grad.detach()
 
