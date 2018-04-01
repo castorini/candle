@@ -162,3 +162,25 @@ class RELAXEstimator(GradientEstimator):
         phi_grad = phi.apply_fn(lambda x, y: ag.grad([y.sum()], [x], retain_graph=True)[0], var_estimate)
         gc.collect()
         return g_relax, phi_grad
+
+def sample_bernoulli_concrete(alpha, temperature, eps=1E-7, gamma=-0.1, zeta=1.1, training=False):
+    u = alpha.clone().detach().uniform_()
+    l = u.log() - (1 - u).log()
+    out = ((zeta - gamma) * F.sigmoid((alpha.log() + l) / temperature) + gamma).clamp(0, 1)
+    return out
+
+class RestrictGradientFunction(ag.Function):
+    @staticmethod
+    def forward(ctx, x, restrict_fn, apply_fn=None):
+        ctx.mask_fn = restrict_fn
+        ctx.apply_fn = apply_fn
+        return x
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        grad_output[ctx.mask_fn(grad_output)] = 0
+        if ctx.apply_fn:
+            grad_output = ctx.apply_fn(grad_output)
+        return grad_output, None, None
+
+restrict_grad = RestrictGradientFunction.apply

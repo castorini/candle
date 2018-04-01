@@ -19,10 +19,26 @@ class SerializableModule(nn.Module):
 class Proxy(object):
     def __init__(self, layer):
         self.child = None
+        self._proxy_layer = None
         self.layer = layer
 
     def parameters(self):
         return []
+
+    @property
+    def proxy_layer(self):
+        return self._proxy_layer
+
+    @proxy_layer.setter
+    def proxy_layer(self, layer):
+        self._proxy_layer = layer
+        return self
+
+    @property
+    def param_options(self):
+        if self.proxy_layer:
+            return self.proxy_layer.param_options
+        return {}
 
     def buffers(self):
         return []
@@ -50,6 +66,17 @@ class ProxyDecorator(Proxy):
     @property
     def root(self):
         return self.child.root
+
+    @property
+    def proxy_layer(self):
+        return self._proxy_layer
+
+    @proxy_layer.setter
+    def proxy_layer(self, layer):
+        if self.child is not None:
+            self.child.proxy_layer = layer
+        self._proxy_layer = layer
+        return self
 
     def print_info(self):
         if self.child is not None:
@@ -104,12 +131,21 @@ class ProxyLayer(nn.Module):
     def __init__(self, weight_provider, registry=None):
         super().__init__()
         self.weight_provider = weight_provider
+        self.weight_provider.proxy_layer = self
         self.output_proxy = None
         self.input_proxy = None
         self.registry = registry
 
         self._param_idx = 0
         self._register_all_params("weight_provider", weight_provider)
+
+    def init_weights(self, init_fn):
+        for param in self.weight_provider.root.parameters():
+            try:
+                if param.dim() > 1:
+                    init_fn(param.data)
+            except ValueError:
+                pass
 
     def _register_all_params(self, proxy_type, proxy):
         self.registry.register_proxy(proxy_type, proxy)
@@ -167,6 +203,14 @@ class ProxyLayer(nn.Module):
         out = self.apply_output_hook(out)
         return out
 
+    @property
+    def param_options(self):
+        return dict(lr_scale=self.lr_scale)
+
+    @property
+    def lr_scale(self):
+        return 1
+
     def on_forward(self, *args, **kwargs):
         raise NotImplementedError
 
@@ -174,6 +218,7 @@ class _ProxyConvNd(ProxyLayer):
     def __init__(self, weight_provider, conv_fn, stride=1, padding=0, dilation=1, **kwargs):
         super().__init__(weight_provider, **kwargs)
         sizes = weight_provider.sizes.reify()
+        self._sizes = sizes
         self.bias = len(sizes) == 2
         self.kernel_size = sizes[0][2:]
         self.stride = stride
@@ -183,6 +228,14 @@ class _ProxyConvNd(ProxyLayer):
         self._conv_kwargs = dict(dilation=dilation, padding=padding, stride=stride)
         if not self.bias:
             self._conv_kwargs["bias"] = None
+
+    @property
+    def lr_scale(self):
+        # _sizes is [(C_out, C_in, kernel_size...), [bias]]
+        n_inputs = np.prod(self.kernel_size) * self._sizes[0][1]
+        n_units = np.prod(self.kernel_size) * self._sizes[0][0]
+        scale = 1 / np.sqrt(1.5 / (n_inputs + n_units))
+        return scale
 
     def on_forward(self, x):
         weights = self.weight_provider().reify()
@@ -203,6 +256,12 @@ class ProxyConv1d(_ProxyConvNd):
 class ProxyLinear(ProxyLayer):
     def __init__(self, weight_provider, **kwargs):
         super().__init__(weight_provider, **kwargs)
+        self._sizes = weight_provider.sizes.reify()
+
+    @property
+    def lr_scale(self):
+        scale = 1 / np.sqrt(1.5 / (np.sum(self._sizes[0])))
+        return scale
 
     def on_forward(self, x):
         weights = self.weight_provider().reify()

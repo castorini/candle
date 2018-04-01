@@ -80,9 +80,9 @@ class Context(object):
     def list_params(self, filter_fn=None, include_opt=True):
         all_proxies = self.list_proxies()
         if filter_fn is None:
-            lst = list(itertools.chain.from_iterable(p.parameters() for p in all_proxies))
+            lst = list(dict(params=p.parameters(), **p.param_options) for p in all_proxies)
         else:
-            lst = list(itertools.chain.from_iterable(p.parameters() for p in filter(filter_fn, all_proxies)))
+            lst = list(dict(params=p.parameters(), **p.param_options) for p in filter(filter_fn, all_proxies))
         if include_opt:
             lst.extend(self.opt_params)
         return lst
