@@ -1,3 +1,4 @@
+import gc
 import copy
 
 from torch.autograd import Variable
@@ -74,20 +75,20 @@ class LeakyTanhFunction(ag.Function):
         return grad_out, None
 
 class BinaryActivation(nn.Module):
-    def __init__(self, t=0., soft=True, limit=None):
+    def __init__(self, t=0., soft=True, stochastic=False):
         super().__init__()
         self.soft = soft
-        self.limit = limit
         self.scale = t
+        self.stochastic = stochastic
 
     def forward(self, x):
         if self.soft:
-            return binary_tanh(x, self.scale)
+            return binary_tanh(x, self.scale, stochastic=self.stochastic)
         else:
-            return binary_tanh(x)
+            return binary_tanh(x, stochastic=self.stochastic)
 
 class StepQuantizeHook(ProxyDecorator):
-    def __init__(self, layer, child, t=0., out_shape=None, soft=True, limit=1, init_uniform=True):
+    def __init__(self, layer, child, t=0., out_shape=None, soft=True, limit=1, init_uniform=False):
         super().__init__(layer, child)
         out_shape = Package(out_shape) if out_shape else self.sizes
         self.soft = soft
@@ -127,16 +128,31 @@ class QuantizeHook(ProxyDecorator):
 def hard_sigmoid(x):
     return inclusive_clamp(((x + 1) / 2), 0, 1)
 
-def binary_tanh(x, scale=1):
-    return 2 * hard_round(hard_sigmoid(x), scale) - 1
+def binary_tanh(x, scale=1, stochastic=False):
+    if stochastic:
+        return 2 * soft_bernoulli(x.sigmoid(), scale) - 1
+    else:
+        return 2 * soft_round(hard_sigmoid(x), scale) - 1
 
-class HardRoundFunction(ag.Function):
+class SoftRoundFunction(ag.Function):
     @staticmethod
     def forward(ctx, input, scale=1):
         if scale < 1:
             return scale * input.round() + (1 - scale) * input
         else:
             return input.round()
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output, None
+
+class SoftBernoulliFunction(ag.Function):
+    @staticmethod
+    def forward(ctx, alpha, scale=1):
+        if scale < 1:
+            return scale * alpha.bernoulli() + (1 - scale) * alpha
+        else:
+            return alpha.bernoulli()
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -247,11 +263,12 @@ class BinaryBatchNorm(nn.Module):
 
 approx_pow2 = ApproxPow2Function.apply
 passthrough_div = PassThroughDivideFunction.apply
-hard_round = HardRoundFunction.apply
+soft_round = SoftRoundFunction.apply
 linear_quant = LinearQuantFunction.apply
 leaky_tanh = LeakyTanhFunction.apply
 leaky_sigmoid = LeakySigmoidFunction.apply
 inclusive_clamp = InclusiveClamp.apply
+soft_bernoulli = SoftBernoulliFunction.apply
 
 class QuantizeContext(Context):
     def __init__(self, **kwargs):
@@ -286,9 +303,12 @@ class StepQuantizeContext(Context):
                 weight = weight[weight > scale]
                 n = weight.numel()
                 try:
-                    delta = torch.sort(weight)[0][int(n * self.scale_alpha)] - scale
+                    idx = int(n * self.scale_alpha)
+                    if idx == 0:
+                        continue
+                    delta = torch.sort(weight)[0][idx] - scale
                     deltas.append(delta.cpu().data.item())
-                    n_elems.append(float(n))
+                    n_elems.append(float(idx + 1))
                 except:
                     continue
 
@@ -306,8 +326,8 @@ class StepQuantizeContext(Context):
             loss = loss + lambd / (param.norm(p=0.66) + 1E-8)
         return loss
 
-    def activation(self, type="tanh", scale=0., soft=True, limit=1):
-        return self.bypass(BinaryActivation(scale, soft, limit=limit))
+    def activation(self, type="tanh", scale=0., soft=True, stochastic=False):
+        return self.bypass(BinaryActivation(scale, soft, stochastic=stochastic))
 
     def compose(self, layer, soft=True, limit=1, scale=0., **kwargs):
         layer = super().compose(layer, **kwargs)

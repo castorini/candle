@@ -3,17 +3,18 @@ import math
 import torch
 
 # Adapted from pytorch repo
-class SignSGD(torch.optim.Optimizer):
+class SGD(torch.optim.Optimizer):
     """
     signSGD that allows for a zero at zero
     """
 
     def __init__(self, params, lr=None, momentum=0, dampening=0,
-                 weight_decay=0, nesterov=False):
+                 weight_decay=0, nesterov=False, sign=False):
         defaults = dict(lr=lr, momentum=momentum, dampening=dampening,
                         weight_decay=weight_decay, nesterov=nesterov, lr_scale=1)
         if nesterov and (momentum <= 0 or dampening != 0):
             raise ValueError("Nesterov momentum requires a momentum and zero dampening")
+        self.sign = sign
         super().__init__(params, defaults)
 
     def __setstate__(self, state):
@@ -52,7 +53,10 @@ class SignSGD(torch.optim.Optimizer):
                     else:
                         d_p = buf
 
-                p.data.add_(-group['lr'] * lr_scale, d_p.sign())
+                if self.sign:
+                    p.data.add_(-group['lr'], d_p.sign())
+                else:
+                    p.data.add_(-group['lr'] * lr_scale, d_p)
 
         return loss
 

@@ -263,6 +263,20 @@ class ProxyLinear(ProxyLayer):
         scale = 1 / np.sqrt(1.5 / (np.sum(self._sizes[0])))
         return scale
 
+    @property
+    def weight(self):
+        return self.weight_provider().reify()[0]
+
+    @property
+    def bias(self):
+        return self.weight_provider().reify()[1]
+
+    def tie_weight(self, weight):
+        root = self.weight_provider.root
+        root._flattened_params[0] = weight
+        root.layer.weight = weight
+        root.package = Package(root._flattened_params)
+
     def on_forward(self, x):
         weights = self.weight_provider().reify()
         return F.linear(x, *weights)

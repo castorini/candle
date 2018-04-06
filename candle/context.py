@@ -57,6 +57,7 @@ class Context(object):
         self._cfg_kwargs.update(kwargs)
         self.registry = ProxyRegistry()
         self.layers = []
+        self.torch_modules = []
         self.opt_params = []
         self.cache = Memoizer()
 
@@ -99,6 +100,7 @@ class Context(object):
 
         kwargs = dict(registry=self.registry)
         provider = self.build_provider(layer)
+        self.torch_modules.append(layer)
 
         if isinstance(layer, nn.modules.conv._ConvNd):
             stride, padding, dilation = layer.stride, layer.padding, layer.dilation
@@ -139,6 +141,7 @@ class Context(object):
 
     def bypass(self, layer):
         self.registry.register_proxy("fake", FakeProxy(layer, layer.parameters()))
+        self.torch_modules.append(layer)
         return layer
 
     def disable_hooks(self):
