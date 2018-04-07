@@ -28,7 +28,7 @@ class LinearQuantFunction(ag.Function):
             nudged_zero_point = quant_max
         else:
             nudged_zero_point = round(zero_point)
-        
+
         nudged_min = -nudged_zero_point * scale
         nudged_max = (quant_max - nudged_zero_point) * scale
         ctx.values = nudged_min, nudged_max
@@ -43,6 +43,14 @@ class LinearQuantFunction(ag.Function):
         nudged_min, nudged_max = ctx.values
         grad_output[(x < nudged_min) | (x > nudged_max)] = 0
         return grad_output, None, None, None
+
+class LinearQuantActivation(nn.Module):
+    def __init__(self, bits, min=-3, max=3):
+        super().__init__()
+        self.args = (bits, min, max)
+
+    def forward(self, x):
+        return linear_quant(x, *self.args)
 
 def sech2(x):
     return 1 - x.tanh()**2
@@ -88,13 +96,14 @@ class BinaryActivation(nn.Module):
             return binary_tanh(x, stochastic=self.stochastic)
 
 class StepQuantizeHook(ProxyDecorator):
-    def __init__(self, layer, child, t=0., out_shape=None, soft=True, limit=1, init_uniform=False):
+    def __init__(self, layer, child, t=0., out_shape=None, soft=True, limit=1, init_uniform=False, rescale=False):
         super().__init__(layer, child)
         out_shape = Package(out_shape) if out_shape else self.sizes
         self.soft = soft
         self.limit = limit
         self.clamp = (-limit, limit)
         self.scale = t
+        self.rescale = rescale
 
         if init_uniform:
             self.layer.init_weights(lambda x: x.uniform_(-1, 1))
@@ -104,13 +113,16 @@ class StepQuantizeHook(ProxyDecorator):
         return self.child.sizes
 
     def call(self, input):
+        from .dorefa import apply_scale
         if self.clamp:
             input.data.clamp_(*self.clamp)
         if self.soft:
-            input = input.apply_fn(lambda x: binary_tanh(x, self.scale))
+            output = input.apply_fn(lambda x: binary_tanh(x, self.scale))
         else:
-            input = input.apply_fn(binary_tanh)
-        return input
+            output = input.apply_fn(binary_tanh)
+        if self.rescale:
+            output = output.apply_fn(lambda x, old_x: apply_scale(x, old_x, True), output)
+        return output
 
 class QuantizeHook(ProxyDecorator):
     def __init__(self, layer, child, bits=8, min=-3, max=3):

@@ -12,6 +12,11 @@ from .estimator import Function
 from .nested import *
 from .proxy import *
 
+class SquareHingeLoss(object):
+    def __call__(self, outputs, targets):
+        loss = ((1 - outputs * targets).clamp(min=0).pow(2)).mean()
+        return loss
+
 class MomentsTracker(object):
     def __init__(self):
         self.reset()
