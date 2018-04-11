@@ -44,7 +44,7 @@ class NAryClampFunction(ag.Function):
 
 class TernaryClampFunction(ag.Function):
     @staticmethod
-    def forward(ctx, x, quantize_factor=False):
+    def forward(ctx, x):
         delta = 0.7 * x.abs().mean()
         new_x = x / delta
         new_x = new_x.clamp(-1, 1).int().float()
@@ -52,8 +52,6 @@ class TernaryClampFunction(ag.Function):
         ctx.alpha = None
         if factor.numel() > 0:
             alpha = factor.abs().mean()
-            if quantize_factor:
-                alpha = linear_quant(alpha, 8, -3, 3)
             ctx.alpha = alpha
             return alpha * new_x
         return new_x
@@ -62,7 +60,7 @@ class TernaryClampFunction(ag.Function):
     def backward(ctx, grad_output):
         if ctx.alpha is not None:
             return grad_output * ctx.alpha
-        return grad_output, None
+        return grad_output
 
 class QuantizeKFunction(ag.Function):
     @staticmethod
@@ -168,9 +166,9 @@ class TernaryQuantizeContext(Context):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
-    def activation(self, k=2, min=-3, max=3):
+    def activation(self, k=2, min=-3, max=3, dynamic=True):
         if k > 2:
-            return self.bypass(LinearQuantActivation(k, min=min, max=max))
+            return self.bypass(LinearQuantActivation(k, min=min, max=max, dynamic=dynamic))
         return self.bypass(TernaryActivation())
 
     def compose(self, layer, chunk=1, chunk_dim=0, **kwargs):

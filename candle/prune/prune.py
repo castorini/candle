@@ -6,10 +6,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
-from .context import *
-from .estimator import Function
-from .nested import *
-from .proxy import *
+from candle.context import *
+from candle.estimator import Function
+from candle.nested import *
+from candle.proxy import *
 
 class WeightMaskGroup(ProxyDecorator):
     def __init__(self, layer, child, init_value=1, stochastic=False):

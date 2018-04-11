@@ -1,5 +1,6 @@
 import gc
 import copy
+import math
 
 from torch.autograd import Variable
 import torch
@@ -16,12 +17,19 @@ from candle.proxy import *
 # Adapted from https://github.com/tensorflow/tensorflow/blob/master/tensorflow/core/kernels/fake_quant_ops_functor.h
 class LinearQuantFunction(ag.Function):
     @staticmethod
-    def forward(ctx, x, bits, min, max):
-        range = max - min
+    def forward(ctx, x, bits, min_, max_, dynamic=True):
+        if dynamic:
+            max_ = max(np.abs(x.max().item()), np.abs(x.min().item()))
+            min_ = -max_
+        range = max_ - min_
+        ctx.skip = False
+        if range == 0:
+            ctx.skip = True
+            return x
         ctx.save_for_backward(x)
         quant_max = (1 << bits) - 1
         scale = range / quant_max
-        zero_point = -min / scale
+        zero_point = -min_ / scale
         if zero_point < 0:
             nudged_zero_point = 0
         elif zero_point > quant_max:
@@ -39,15 +47,17 @@ class LinearQuantFunction(ag.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
+        if ctx.skip:
+            return grad_output, None, None, None, None
         x, = ctx.saved_variables
         nudged_min, nudged_max = ctx.values
         grad_output[(x < nudged_min) | (x > nudged_max)] = 0
-        return grad_output, None, None, None
+        return grad_output, None, None, None, None
 
 class LinearQuantActivation(nn.Module):
-    def __init__(self, bits, min=-3, max=3):
+    def __init__(self, bits, min=-3, max=3, dynamic=True):
         super().__init__()
-        self.args = (bits, min, max)
+        self.args = (bits, min, max, dynamic)
 
     def forward(self, x):
         return linear_quant(x, *self.args)
@@ -96,7 +106,7 @@ class BinaryActivation(nn.Module):
             return binary_tanh(x, stochastic=self.stochastic)
 
 class StepQuantizeHook(ProxyDecorator):
-    def __init__(self, layer, child, t=0., out_shape=None, soft=True, limit=1, init_uniform=False, rescale=False):
+    def __init__(self, layer, child, t=0., out_shape=None, soft=True, limit=1, init_uniform=True, rescale=False):
         super().__init__(layer, child)
         out_shape = Package(out_shape) if out_shape else self.sizes
         self.soft = soft
@@ -213,13 +223,16 @@ class PassThroughDivideFunction(ag.Function):
         x, y = ctx.saved_variables
         return grad_output, -grad_output * x / y**2
 
-class BinaryBatchNorm(nn.Module):
-    def __init__(self, num_features, momentum=0.125, eps=1e-5, affine=True):
+class QuantizedBatchNorm(nn.Module):
+    def __init__(self, num_features, momentum=0.125, eps=1e-5, affine=True, k=8, min=-2, max=2):
         super().__init__()
         self.num_features = num_features
         self.affine = affine
         self.eps = eps
         self.momentum = momentum
+        self.k = k
+        self.min = min
+        self.max = max
         if self.affine:
             self.weight = nn.Parameter(torch.Tensor(num_features))
             self.bias = nn.Parameter(torch.Tensor(num_features))
@@ -229,6 +242,13 @@ class BinaryBatchNorm(nn.Module):
         self.register_buffer("mean", torch.zeros(num_features))
         self.register_buffer("var", torch.ones(num_features))
         self.reset_parameters()
+        self._init_quantize_fn()
+
+    def _init_quantize_fn(self):
+        if self.k == 1:
+            self.quantize_fn = approx_pow2
+        else:
+            self.quantize_fn = lambda x: linear_quant(x, self.k, self.min, self.max)
 
     def reset_parameters(self):
         self.mean.zero_()
@@ -253,22 +273,20 @@ class BinaryBatchNorm(nn.Module):
     def forward(self, input):
         if self.training:
             new_mean = self._reorg(input).mean(1).data
-            self.mean = (1 - self.momentum) * self.mean + self.momentum * new_mean
+            self.mean = self.quantize_fn((1 - self.momentum) * self.mean + self.momentum * new_mean)
         mean = self._convert_param(input, self.mean)
-        ctr_in = input - Variable(mean)
-        ctr_in_ap2 = approx_pow2(ctr_in)
+        ctr_in = self.quantize_fn(input - Variable(mean))
 
         if self.training:
-            new_var = self._reorg(ctr_in * ctr_in_ap2).mean(1).data
-            self.var = (1 - self.momentum) * self.var + self.momentum * new_var
+            new_var = self._reorg(ctr_in * ctr_in).mean(1).data
+            self.var = self.quantize_fn((1 - self.momentum) * self.var + self.momentum * new_var)
         var = self._convert_param(input, self.var)
-        x = ctr_in_ap2 * approx_pow2(1 / torch.sqrt(Variable(var) + self.eps))
-        x = approx_pow2(x)
+        x = self.quantize_fn(ctr_in / self.quantize_fn(torch.sqrt(Variable(var) + self.eps)))
 
         if self.affine:
             w1 = self._convert_param(x, self.weight)
             b1 = self._convert_param(x, self.bias)
-            y = approx_pow2(w1) * x + b1
+            y = self.quantize_fn(self.quantize_fn(w1) * x + self.quantize_fn(b1))
         else:
             y = x
         return y
