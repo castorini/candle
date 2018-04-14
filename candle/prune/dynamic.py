@@ -19,12 +19,14 @@ def align_mask(x, other):
     return other.expand_as(x)
 
 class LinearMarkovDropout(nn.Module):
-    def __init__(self, end_prob=0, min_length=0, variational=False):
+    def __init__(self, end_prob=0, min_length=0, variational=False, rescale=False):
         super().__init__()
         self.end_prob = end_prob
         self.variational = variational
         self.fixed_size = None
         self.min_length = min_length
+        self.rescale = rescale
+        self._x_cache = None
 
     def fix(self, fixed_size):
         self.fixed_size = fixed_size
@@ -41,8 +43,23 @@ class LinearMarkovDropout(nn.Module):
         if self.variational:
             for idx in range(x.size(0)):
                 end_idx = random.randint(min_length, min_length + size - 1)
-                x[idx, end_idx:, ...] = 0
+                x.data[idx, end_idx:, ...] = 0
+                if self.rescale:
+                    x[idx, ...] *= x.size(1) / end_idx
         else:
             end_idx = random.randint(min_length, min_length + size - 1)
+            x = x.clone()
             x[:, end_idx:, ...] = 0
+            if self.rescale:
+                if self._x_cache is None:
+                    self._x_cache = torch.arange(1, self.end_prob, -(1 - self.end_prob) / (x.size(1) - min_length))
+                    if x.is_cuda:
+                        self._x_cache = self._x_cache.cuda()
+                if end_idx - min_length == 0:
+                    return x
+                rescale = self._x_cache[:end_idx - min_length]
+                rescale = rescale.unsqueeze(0)
+                for _ in x.data.size()[2:]:
+                    rescale = rescale.unsqueeze(-1)
+                x[:, min_length:end_idx, ...] /= rescale.expand_as(x[:, min_length:end_idx, ...])
         return x
