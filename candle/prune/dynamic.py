@@ -20,7 +20,7 @@ def align_mask(x, other):
 
 class LinearMarkovDropout(nn.Module):
     def __init__(self, end_prob=0, min_length=0, rescale=True, tied=False, 
-            tied_generator=None, tied_root=False, rebias=True, size=None):
+            tied_generator=None, tied_root=False, rebias=False, size=None):
         super().__init__()
         self.end_prob = end_prob
         self.fixed_size = None
