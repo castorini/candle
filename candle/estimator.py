@@ -183,4 +183,14 @@ class RestrictGradientFunction(ag.Function):
             grad_output = ctx.apply_fn(grad_output)
         return grad_output, None, None
 
+class StraightThroughBernoulliFunction(ag.Function):
+    @staticmethod
+    def forward(ctx, x):
+        return x.bernoulli()
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output
+
+st_bernoulli = StraightThroughBernoulliFunction.apply
 restrict_grad = RestrictGradientFunction.apply

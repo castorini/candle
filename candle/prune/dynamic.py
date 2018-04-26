@@ -18,6 +18,40 @@ def align_mask(x, other):
         other = other.unsqueeze(-1)
     return other.expand_as(x)
 
+class AlphaDropout(nn.Module):
+    def __init__(self, size, init=0.5, bounds=(0.05, 0.99)):
+        super().__init__()
+        self.size = size
+        self.mask = nn.Parameter(torch.Tensor(size).fill_(init))
+        self.bounds = bounds
+        self.active = False
+        self.pruned = False
+
+    def prune(self, keep_pct=None, fixed_size=None):
+        prune_pct = 1 - keep_pct
+        if fixed_size is None:
+            fixed_size = int(prune_pct * self.size)
+        else:
+            fixed_size = self.size - fixed_size
+        self.active = True
+        self.pruned = True
+        _, indices = torch.sort(self.mask)
+        indices = indices[:fixed_size]
+        self.mask.data[indices] = 0
+        self.mask.data[self.mask.data != 0] = 1
+        return indices
+
+    def forward(self, x):
+        if not self.active:
+            return x
+        if not self.pruned:
+            self.mask.data.clamp_(*self.bounds)
+        mask = self.mask.unsqueeze(0)
+        for _ in x.size()[2:]:
+            mask = mask.unsqueeze(-1)
+        mask = st_bernoulli(mask)
+        return mask.expand_as(x) * x
+
 class LinearMarkovDropout(nn.Module):
     def __init__(self, end_prob=0, min_length=0, rescale=True, tied=False, 
             tied_generator=None, tied_root=False, rebias=False, size=None):

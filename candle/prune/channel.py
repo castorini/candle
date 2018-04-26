@@ -27,6 +27,31 @@ class ChannelDropout(nn.Module):
         x = (x * mask.expand_as(x)) / (1 - self.drop_prob)
         return x
 
+def linear_prune_qrnn(linear, percentage=None, fixed_size=None, mode="out"):
+    linear.pruned_indices = []
+    Z_w, F_w, O_w = linear.module.weight_raw.data.chunk(3, dim=0)
+    Z_b, F_b, O_b = linear.module.bias.data.chunk(3, dim=0)
+    if mode == "out":
+        if percentage is not None:
+            fixed_size = int(percentage * Z_w.size(0))
+        Z_w = Z_w[:fixed_size, :]
+        F_w = F_w[:fixed_size, :]
+        O_w = O_w[:fixed_size, :]
+        Z_b = Z_b[:fixed_size]
+        F_b = F_b[:fixed_size]
+        O_b = O_b[:fixed_size]
+        linear.module.weight_raw.data = torch.cat([Z_w, F_w, O_w], 0)
+        linear.module.bias.data = torch.cat([Z_b, F_b, O_b], 0)
+    elif mode == "in":
+        if percentage is not None:
+            fixed_size = int(percentage * Z_w.size(1))
+        Z_w = Z_w[:, :fixed_size]
+        F_w = F_w[:, :fixed_size]
+        O_w = O_w[:, :fixed_size]
+        linear.module.weight_raw.data = torch.cat([Z_w, F_w, O_w], 0)
+
+    return fixed_size
+
 def prune_qrnn(linear, percentage, p=1):
     linear.pruned_indices = []
     Z_w, F_w, O_w = linear.module.weight_raw.chunk(3, dim=0)

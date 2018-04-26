@@ -11,6 +11,15 @@ def read_cli_config():
     parser = argparse.ArgumentParser()
     return parser.parse_known_args()[0]
 
+def find_modules(net, *types):
+    modules = []
+    for module in net.modules():
+        for t in types:
+            if isinstance(module, t):
+                modules.append(module)
+                break
+    return modules
+
 class ProxyRegistry(object):
     def __init__(self):
         self.table = {}
