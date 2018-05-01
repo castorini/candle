@@ -79,7 +79,6 @@ def prune_qrnn(linear, percentage, p=1):
         linear.module.bias.data[idx3] = 0
         linear.pruned_indices.extend([idx1, idx2, idx3])
     indices.sort()
-    print(indices)
 
 def prune_global_norm(model, percentage, p=1):
     global_scores = []
